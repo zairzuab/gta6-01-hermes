@@ -1,15 +1,16 @@
-// Boot and the one loop.
+// PORT AZUL: Neon Tide — entry point and the one loop.
 //
-// The world is built from the city, the traffic, the police, the player and
-// the mission runner; this file owns the renderer, the third-person camera,
-// the input routing, the combat resolution, the pickups, the HUD and the
-// title / pause / phone / end screens. Simulation runs in fixed 1/60 s steps
-// (several in a slow frame, none in a fast one) and the renderer paints after.
+// This module wires the whole game together. It owns the renderer, the third
+// person camera, the input routing, the combat resolution, the pickups, the HUD
+// and the four screens (title / pause / phone / end); every other module is a
+// system it drives. Simulation advances in fixed 1/60 s steps so the physics
+// are frame-rate independent; the renderer paints once per animation frame.
 //
-// ?shot=start|play|chase|boardwalk|docks stages a scene for a screenshot and
-// sets window.__shotReady; ?time=HH:MM and ?seed=N pin the clock and the RNG.
-// ?time= is honoured on the title screen too, so a staged shot can pin the hour
-// before the first frame (the HUD clock is only written while playing).
+// Query parameters stage a deterministic scene for a screenshot:
+//   ?shot=start|play|chase|boardwalk|docks  builds a preset and sets
+//                                            window.__shotReady
+//   ?time=HH:MM                              pins the clock before frame one
+//   ?seed=N                                  pins the RNG that places pickups
 import * as THREE from 'three';
 import { City, COAST_Z } from './city.js';
 import { Player } from './player.js';
@@ -23,21 +24,28 @@ import { MissionRunner, MISSIONS } from './missions.js';
 import { makePickup } from './vehicles.js';
 import { clamp, damp, angleDelta, formatMoney, formatClock, mulberry32 } from './util.js';
 
+const STEP = 1 / 60;          // one simulation step, seconds
+const MAX_FRAME = 0.25;       // a longer gap than this is discarded
+const MAX_STEPS_PER_FRAME = 5;
+
 const $ = (id) => document.getElementById(id);
 const params = new URLSearchParams(window.location.search);
-const bootEl = $('boot');
-let bootHidden = false;
+
+// ---- session randomness -----------------------------------------------------
+// Pickup phases come from this seeded stream so a screenshot seed reproduces
+// exactly; everything else keeps using Math.random inside its own module.
 const seedParam = Number.parseInt(params.get('seed') ?? '', 10);
 const seed = Number.isInteger(seedParam) ? seedParam : 20261123;
 const rnd = mulberry32(seed);
 
-// ---- renderer --------------------------------------------------------------
+// ===========================================================================
+// Renderer, scene, camera
+// ===========================================================================
 const canvas = $('scene');
 let renderer;
 try {
   renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
 } catch (err) {
-  // No WebGL: say so on the boot overlay instead of failing silently.
   const bootErr = $('bootErr');
   if (bootErr) bootErr.textContent = 'WebGL could not start: ' + (err?.message || err);
   throw err;
@@ -54,8 +62,8 @@ const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(62, window.innerWidth / window.innerHeight, 0.1, 4200);
 camera.position.set(60, 26, 170);
 
-// A soft camera-following fill so the player and their car always read, even
-// on the shadowed side of the street at night.
+// A fill light that rides the camera so the player and their ride always read,
+// even on the shadowed side of a street at night.
 const fill = new THREE.DirectionalLight(0xe8f0ff, 0.5);
 scene.add(fill);
 scene.add(fill.target);
@@ -66,7 +74,9 @@ window.addEventListener('resize', () => {
   renderer.setSize(window.innerWidth, window.innerHeight);
 });
 
-// ---- the world -------------------------------------------------------------
+// ===========================================================================
+// Systems
+// ===========================================================================
 const city = new City(scene);
 const traffic = new Traffic(scene, city);
 const player = new Player(scene, city);
@@ -77,34 +87,30 @@ const sound = new SoundBank();
 const input = new Input(canvas);
 const missions = new MissionRunner();
 
-// Traffic and the hero car are built after the City's own scan, so their
-// headlight beams have to be registered before the first night pass.
+// The hero car and the traffic are built after the city's own geometry scan,
+// so their headlight beams must be registered before the first night pass.
 city.collectHeadlights();
 
-// ---- day / night -----------------------------------------------------------
+// ===========================================================================
+// Day / night environment
+// ===========================================================================
 const env = { day: 1, dusk: 0, sunDir: new THREE.Vector3(0, 1, 0), focus: new THREE.Vector3() };
 const _sun = new THREE.Vector3();
+
 const timeParam = params.get('time');
 let clockMin = timeParam && /^\d{1,2}:\d{2}$/.test(timeParam)
   ? (Number(timeParam.slice(0, 2)) * 60 + Number(timeParam.slice(3, 5)))
   : 18 * 60 + 45;
-let timeScale = 1.6;           // game minutes per real second
-// The title screen does not run updateHud(), so the clock is painted once here
-// (and again by updateHud as soon as play starts).
-const paintClock = () => { $('clock').textContent = formatClock(clockMin); };
-paintClock();
-/** The menu keeps a clock of its own, pinned by ?time= before the game starts. */
-const paintTitleClock = () => { const el = $('titleClock'); if (el) el.textContent = formatClock(clockMin); };
-paintTitleClock();
+let timeScale = 1.6;          // game minutes per real second
 
-/** Sun elevation, daylight factor and dusk factor for a clock time. */
+/** Sun elevation, daylight factor and dusk factor for a clock minute value. */
 function sunEnv(minutes) {
-  const dayT = (minutes - 360) / 780;          // 06:00 -> 0, 19:00 -> 1
-  const alt = Math.sin(dayT * Math.PI);        // -1 .. 1
+  const dayT = (minutes - 360) / 780;         // 06:00 -> 0, 19:00 -> 1
+  const alt = Math.sin(dayT * Math.PI);       // -1 .. 1
   const az = Math.PI * (0.2 + 0.6 * dayT);
   const up = Math.max(0.05, alt) * 1.15;
   _sun.set(Math.cos(az), up, Math.sin(az) * 0.62).normalize();
-  if (alt <= 0.02) _sun.set(-0.38, 0.5, -0.5).normalize();   // the moon
+  if (alt <= 0.02) _sun.set(-0.38, 0.5, -0.5).normalize();   // below the horizon: the moon
   return {
     day: clamp(alt * 1.7 + 0.1, 0, 1),
     dusk: clamp(1 - Math.abs(alt) * 3.0, 0, 1),
@@ -112,8 +118,26 @@ function sunEnv(minutes) {
   };
 }
 
-// ---- game state ------------------------------------------------------------
-let state = 'title';           // title | play | pause | phone | end
+function applySunEnv() {
+  const s = sunEnv(clockMin);
+  env.day = s.day;
+  env.dusk = s.dusk;
+  env.sunDir.copy(s.sunDir);
+  env.focus.set(player.x, player.groundY + 1.6, player.z);
+}
+
+/** Paint both clocks; the menu clock is only written while no screen runs. */
+function paintClocks() {
+  $('clock').textContent = formatClock(clockMin);
+  const titleClock = $('titleClock');
+  if (titleClock) titleClock.textContent = formatClock(clockMin);
+}
+paintClocks();
+
+// ===========================================================================
+// Game state
+// ===========================================================================
+let state = 'title';          // title | play | pause | phone | end
 let stateBeforePhone = 'play';
 let simTime = 0;
 let idleTime = 0;
@@ -121,21 +145,22 @@ let fps = 0;
 let fpsAccum = 0;
 let fpsFrames = 0;
 let muted = false;
-let cleanArmed = false;
+let cleanArmed = false;       // has the run had heat since the last "lose the heat"
 let ramHits = 0;
 let nextMissionTimer = 0;
 let storyTimer = 0;
 let shotFrames = 0;
 let wreckWarned = false;
 let freeCam = null;
-// The orbit the title and end screens use; a staged screenshot overrides it
-// with its own `cam`, and normal play passes null so the chase cam drives.
+
 const MENU_CAM = { dist: 30, pitch: 0.3, spin: 0.1 };
+
 const mctx = {
-  inCar: false, wanted: 0, markerDist: Infinity, speed: 0, startedClean: false, ramHits: 0,
-  shotsFired: 0, pedDowns: 0, wantedPeak: 0,
+  inCar: false, wanted: 0, markerDist: Infinity, speed: 0, startedClean: false,
+  ramHits: 0, shotsFired: 0, pedDowns: 0, wantedPeak: 0,
 };
-/** A run-statistics snapshot for the pause / end screens. */
+
+/** The run-statistics snapshot the pause and end screens print. */
 function runStats() {
   return {
     shots: mctx.shotsFired,
@@ -146,7 +171,9 @@ function runStats() {
   };
 }
 
-// ---- camera ----------------------------------------------------------------
+// ===========================================================================
+// Camera rig
+// ===========================================================================
 const camRig = {
   mode: 0, yaw: Math.PI, pitch: 0.34, shake: 0,
   pos: new THREE.Vector3(70, 30, 180),
@@ -155,72 +182,87 @@ const camRig = {
     this.mode = (this.mode + 1) % 3;
     hud.toast(['CHASE CAM', 'HOOD CAM', 'AERIAL CAM'][this.mode]);
   },
-  update(dt, free) {
-    const p = player;
-    const desired = new THREE.Vector3();
-    const lookAt = new THREE.Vector3();
-    if (free) {
-      this.yaw += dt * free.spin;
-      const cp = Math.cos(free.pitch);
-      desired.set(
-        p.x + Math.sin(this.yaw) * cp * free.dist,
-        p.groundY + 1.9 + Math.sin(free.pitch) * free.dist,
-        p.z + Math.cos(this.yaw) * cp * free.dist);
-      lookAt.set(p.x, p.groundY + (free.look ?? 2.4), p.z);
-      this.pos.lerp(desired, 1 - Math.exp(-2.6 * dt));
-      this.look.lerp(lookAt, 1 - Math.exp(-3.4 * dt));
-    } else if (p.inCar) {
-      const behind = p.heading + p.camOrbit;
-      const dist = this.mode === 1 ? 0.2 : this.mode === 2 ? 24 : 8.6;
-      const pitch = this.mode === 1 ? 0.1 : this.mode === 2 ? 0.95 : 0.3;
-      this.yaw += angleDelta(this.yaw, behind) * Math.min(1, dt * 5);
-      const cp = Math.cos(pitch);
-      let d = dist;
-      for (let i = 0; i < 6; i++) {
-        const tx = p.x + Math.sin(this.yaw) * cp * d;
-        const tz = p.z + Math.cos(this.yaw) * cp * d;
-        const ty = p.groundY + 1.7 + Math.sin(pitch) * d;
-        if (!city.hitsBuilding(tx, tz, 0.6) && !city.isWater(tx, tz)) break;
-        d *= 0.7;
-      }
-      desired.set(
-        p.x + Math.sin(this.yaw) * cp * d,
-        Math.max(0.5, p.groundY + 1.7 + Math.sin(pitch) * d),
-        p.z + Math.cos(this.yaw) * cp * d);
-      lookAt.set(p.x - Math.sin(this.yaw) * 5, p.groundY + 1.5, p.z - Math.cos(this.yaw) * 5);
-      const k = this.mode === 1 ? 1 : 1 - Math.exp(-9 * dt);
-      this.pos.lerp(desired, k);
-      this.look.lerp(lookAt, 1 - Math.exp(-12 * dt));
-    } else {
-      this.yaw = p.camYaw;
-      const pitch = p.camPitch;
-      const dist = this.mode === 2 ? 22 : 5.6;
-      const cp = Math.cos(pitch);
-      let d = dist;
-      for (let i = 0; i < 6; i++) {
-        const tx = p.x + Math.sin(this.yaw) * cp * d;
-        const tz = p.z + Math.cos(this.yaw) * cp * d;
-        const ty = p.groundY + 1.7 + Math.sin(pitch) * d;
-        if (!city.hitsBuilding(tx, tz, 0.5) && !city.isWater(tx, tz) && ty > 0.4) break;
-        d *= 0.7;
-      }
-      desired.set(
-        p.x + Math.sin(this.yaw) * cp * d,
-        Math.max(0.45, p.groundY + 1.7 + Math.sin(pitch) * d),
-        p.z + Math.cos(this.yaw) * cp * d);
-      lookAt.set(p.x - Math.sin(this.yaw) * 4.5, p.groundY + 1.55, p.z - Math.cos(this.yaw) * 4.5);
-      this.pos.lerp(desired, 1 - Math.exp(-15 * dt));
-      this.look.lerp(lookAt, 1 - Math.exp(-17 * dt));
-    }
 
+  /** Pull `d` back until the point at the given pitch clears walls and surf. */
+  pullBack(x, z, baseY, margin, floorY) {
+    let d = this._wantD;
+    for (let i = 0; i < 6; i++) {
+      const tx = x + Math.sin(this.yaw) * Math.cos(this.pitch) * d;
+      const tz = z + Math.cos(this.yaw) * Math.cos(this.pitch) * d;
+      const ty = baseY + 1.7 + Math.sin(this.pitch) * d;
+      if (!city.hitsBuilding(tx, tz, margin) && !city.isWater(tx, tz) && ty > floorY) break;
+      d *= 0.7;
+    }
+    return d;
+  },
+
+  /** Orbit a free camera (menus and staged shots) around the player. */
+  updateFree(dt, free) {
+    this.yaw += dt * free.spin;
+    const cp = Math.cos(free.pitch);
+    this._wantD = free.dist;
+    this.pullBack(player.x, player.z, player.groundY, 0.6, 0.45);
+    const d = this._wantD;
+    const desired = new THREE.Vector3(
+      player.x + Math.sin(this.yaw) * cp * d,
+      player.groundY + 1.9 + Math.sin(free.pitch) * d,
+      player.z + Math.cos(this.yaw) * cp * d);
+    const lookAt = new THREE.Vector3(player.x, player.groundY + (free.look ?? 2.4), player.z);
+    this.pos.lerp(desired, 1 - Math.exp(-2.6 * dt));
+    this.look.lerp(lookAt, 1 - Math.exp(-3.4 * dt));
+  },
+
+  /** Follow the player's car, with hood and aerial alternatives. */
+  updateInCar(dt) {
+    const behind = player.heading + player.camOrbit;
+    this.yaw += angleDelta(this.yaw, behind) * Math.min(1, dt * 5);
+    this.pitch = this.mode === 1 ? 0.1 : this.mode === 2 ? 0.95 : 0.3;
+    this._wantD = this.mode === 1 ? 0.2 : this.mode === 2 ? 24 : 8.6;
+    const d = this.pullBack(player.x, player.z, player.groundY, 0.6, 0.5);
+    const cp = Math.cos(this.pitch);
+    const desired = new THREE.Vector3(
+      player.x + Math.sin(this.yaw) * cp * d,
+      Math.max(0.5, player.groundY + 1.7 + Math.sin(this.pitch) * d),
+      player.z + Math.cos(this.yaw) * cp * d);
+    const lookAt = new THREE.Vector3(
+      player.x - Math.sin(this.yaw) * 5, player.groundY + 1.5, player.z - Math.cos(this.yaw) * 5);
+    const k = this.mode === 1 ? 1 : 1 - Math.exp(-9 * dt);
+    this.pos.lerp(desired, k);
+    this.look.lerp(lookAt, 1 - Math.exp(-12 * dt));
+  },
+
+  /** Follow the walker from the player's own camera angles. */
+  updateOnFoot(dt) {
+    this.yaw = player.camYaw;
+    this.pitch = player.camPitch;
+    this._wantD = this.mode === 2 ? 22 : 5.6;
+    const d = this.pullBack(player.x, player.z, player.groundY, 0.5, 0.4);
+    const cp = Math.cos(this.pitch);
+    const desired = new THREE.Vector3(
+      player.x + Math.sin(this.yaw) * cp * d,
+      Math.max(0.45, player.groundY + 1.7 + Math.sin(this.pitch) * d),
+      player.z + Math.cos(this.yaw) * cp * d);
+    const lookAt = new THREE.Vector3(
+      player.x - Math.sin(this.yaw) * 4.5, player.groundY + 1.55, player.z - Math.cos(this.yaw) * 4.5);
+    this.pos.lerp(desired, 1 - Math.exp(-15 * dt));
+    this.look.lerp(lookAt, 1 - Math.exp(-17 * dt));
+  },
+
+  update(dt, free) {
+    if (free) this.updateFree(dt, free);
+    else if (player.inCar) this.updateInCar(dt);
+    else this.updateOnFoot(dt);
+
+    // Shake decays; a crash or a melee hit can spike it.
     this.shake = Math.max(0, this.shake - dt * 2.4);
-    const s = this.shake * this.shake * 0.6 + p.crashShake * 0.22;
+    const s = this.shake * this.shake * 0.6 + player.crashShake * 0.22;
     camera.position.set(
       this.pos.x + (Math.random() - 0.5) * s,
       this.pos.y + (Math.random() - 0.5) * s,
       this.pos.z + (Math.random() - 0.5) * s);
     camera.lookAt(this.look);
-    const targetFov = 62 + (p.inCar ? Math.min(14, Math.abs(p.speed) * 0.3) : 0);
+    // The view widens with speed so a fast ride reads as fast.
+    const targetFov = 62 + (player.inCar ? Math.min(14, Math.abs(player.speed) * 0.3) : 0);
     if (Math.abs(camera.fov - targetFov) > 0.05) {
       camera.fov += (targetFov - camera.fov) * Math.min(1, dt * 4);
       camera.updateProjectionMatrix();
@@ -228,7 +270,9 @@ const camRig = {
   },
 };
 
-// ---- mission marker --------------------------------------------------------
+// ===========================================================================
+// Mission marker beacon
+// ===========================================================================
 const markerBeam = new THREE.Mesh(
   new THREE.CylinderGeometry(1.5, 1.5, 34, 18, 1, true),
   new THREE.MeshBasicMaterial({
@@ -237,6 +281,7 @@ const markerBeam = new THREE.Mesh(
   }));
 markerBeam.visible = false;
 scene.add(markerBeam);
+
 const markerRing = new THREE.Mesh(
   new THREE.TorusGeometry(3.6, 0.18, 8, 32),
   new THREE.MeshBasicMaterial({ color: 0xffd75e, fog: false }));
@@ -244,31 +289,42 @@ markerRing.rotation.x = Math.PI / 2;
 markerRing.visible = false;
 scene.add(markerRing);
 
+/** Place and animate the objective beacon; hide it when there is no objective. */
 function updateMarker(dt) {
   const st = missions.stage();
   let m = missions.marker;
-  if (st && st.target === 'ram' && traffic.rival) m = { x: traffic.rival.x, z: traffic.rival.z, color: 0xff4d5e, kind: 'ram' };
-  if (!m) { markerBeam.visible = false; markerRing.visible = false; return; }
+  // A ram stage tracks the runner directly so the marker never lags behind.
+  if (st && st.target === 'ram' && traffic.rival) {
+    m = { x: traffic.rival.x, z: traffic.rival.z, color: 0xff4d5e, kind: 'ram' };
+  }
+  if (!m) {
+    markerBeam.visible = false;
+    markerRing.visible = false;
+    return;
+  }
   const gy = city.groundHeightAt(m.x, m.z);
   markerBeam.visible = true;
   markerRing.visible = true;
   markerBeam.position.set(m.x, gy + 17, m.z);
   markerRing.position.set(m.x, gy + 0.25, m.z);
   markerRing.rotation.z += dt * 0.8;
-  const pulse = 1 + Math.sin(simTime * 4) * 0.12;
-  markerRing.scale.setScalar(pulse);
+  markerRing.scale.setScalar(1 + Math.sin(simTime * 4) * 0.12);
   markerBeam.material.color.setHex(m.color);
   markerRing.material.color.setHex(m.color);
 }
 
-// ---- pickups ---------------------------------------------------------------
+// ===========================================================================
+// Pickups
+// ===========================================================================
 const pickups = [];
+
 function addPickup(kind, x, z, weaponId = null) {
   const mesh = makePickup(kind);
   mesh.position.set(x, city.groundHeightAt(x, z), z);
   scene.add(mesh);
   pickups.push({ kind, weaponId, x, z, mesh, taken: false, phase: rnd() * 6 });
 }
+
 function buildPickups() {
   addPickup('health', 90, -74);
   addPickup('health', 96, 34);
@@ -284,6 +340,7 @@ function buildPickups() {
 }
 buildPickups();
 
+/** Bob and spin each pickup, and collect the one the player walks into. */
 function updatePickups(dt) {
   for (const p of pickups) {
     if (p.taken) continue;
@@ -296,9 +353,15 @@ function updatePickups(dt) {
 function collect(p) {
   p.taken = true;
   scene.remove(p.mesh);
-  if (p.kind === 'health') { player.heal(45); sound.pickup(); hud.toast('+45 HEALTH'); }
-  else if (p.kind === 'armour') { player.addArmour(60); sound.pickup(); hud.toast('+60 ARMOUR'); }
-  else if (p.kind === 'cash') {
+  if (p.kind === 'health') {
+    player.heal(45);
+    sound.pickup();
+    hud.toast('+45 HEALTH');
+  } else if (p.kind === 'armour') {
+    player.addArmour(60);
+    sound.pickup();
+    hud.toast('+60 ARMOUR');
+  } else if (p.kind === 'cash') {
     missions.save.money += 1500;
     sound.cash();
     hud.toast('+$1,500');
@@ -311,22 +374,29 @@ function collect(p) {
   missions.persist();
 }
 
-// ---- smoke -----------------------------------------------------------------
+// ===========================================================================
+// Smoke puffs
+// ===========================================================================
 const smokes = [];
 const smokeGeo = new THREE.SphereGeometry(0.5, 8, 6);
+
 function puff(x, y, z, dark) {
-  const mat = new THREE.MeshBasicMaterial({ color: dark ? 0x222222 : 0x9aa0a6, transparent: true, opacity: 0.4, depthWrite: false });
+  const mat = new THREE.MeshBasicMaterial({
+    color: dark ? 0x222222 : 0x9aa0a6, transparent: true, opacity: 0.4, depthWrite: false,
+  });
   const m = new THREE.Mesh(smokeGeo, mat);
   m.position.set(x, y, z);
   m.scale.setScalar(0.5);
   scene.add(m);
-  smokes.push({ m, life: 1.4, dark });
+  smokes.push({ m, life: 1.4 });
 }
+
+/** Emit damage smoke from the player's car, dead cars and a stopped runner. */
 function updateSmoke(dt) {
-  // The player's car smokes when its engine is hurt; dead cars smoke harder.
   if (player.inCar && player.enginePct < 58 && Math.random() < dt * (player.enginePct < 34 ? 22 : 8)) {
     const back = player.heading + Math.PI;
-    puff(player.x - Math.sin(back) * 1.8, player.groundY + 0.8, player.z - Math.cos(back) * 1.8, player.enginePct < 34);
+    puff(player.x - Math.sin(back) * 1.8, player.groundY + 0.8, player.z - Math.cos(back) * 1.8,
+      player.enginePct < 34);
   }
   for (const c of traffic.cars) {
     if (c.dead && Math.random() < dt * 6) puff(c.x, 1.2, c.z, true);
@@ -348,11 +418,14 @@ function updateSmoke(dt) {
   }
 }
 
-// ---- combat ----------------------------------------------------------------
+// ===========================================================================
+// Combat
+// ===========================================================================
 const _dir = new THREE.Vector3();
 const _muzzle = new THREE.Vector3();
 const _end = new THREE.Vector3();
 
+/** Ray / sphere intersection; nearest positive t or Infinity. */
 function raySphere(o, d, cx, cy, cz, r) {
   const ox = o.x - cx, oy = o.y - cy, oz = o.z - cz;
   const b = ox * d.x + oy * d.y + oz * d.z;
@@ -363,17 +436,7 @@ function raySphere(o, d, cx, cy, cz, r) {
   return t > 0 ? t : Infinity;
 }
 
-/** Slab test against every building footprint; nearest hit distance or maxT. */
-function rayBuildings(o, d, maxT) {
-  let best = maxT;
-  for (const c of city.colliders) {
-    const h = c.h || 30;
-    const t = rayBox(o, d, c.x - c.halfX, 0, c.z - c.halfZ, c.x + c.halfX, h, c.z + c.halfZ, best);
-    if (t < best) best = t;
-  }
-  return best;
-}
-
+/** Slab test against one box; t along the ray or Infinity. */
 function rayBox(o, d, minx, miny, minz, maxx, maxy, maxz, maxT) {
   let tmin = 0, tmax = maxT;
   const axes = [
@@ -395,12 +458,24 @@ function rayBox(o, d, minx, miny, minz, maxx, maxy, maxz, maxT) {
   return tmin;
 }
 
+/** Nearest building hit along the ray, capped at `maxT`. */
+function rayBuildings(o, d, maxT) {
+  let best = maxT;
+  for (const c of city.colliders) {
+    const h = c.h || 30;
+    const t = rayBox(o, d, c.x - c.halfX, 0, c.z - c.halfZ, c.x + c.halfX, h, c.z + c.halfZ, best);
+    if (t < best) best = t;
+  }
+  return best;
+}
+
+/**
+ * Fire the current weapon down the camera ray. Only an automatic weapon keeps
+ * firing while the trigger is held; a pistol, shotgun or rifle needs a fresh
+ * click, which is what the arsenal's per-click guard enforces.
+ */
 function fireWeapon(dt) {
   const w = arsenal.current();
-  // Only an automatic weapon keeps firing while the trigger is held; a pistol,
-  // shotgun or rifle needs a fresh click, which is what `tryFire`'s
-  // `_firedThisClick` guard is for. Passing `mouseDown` outright made every
-  // weapon fully automatic and the guard dead code.
   const res = arsenal.tryFire(dt, input.mouseDown && w.auto);
   if (!res) return;
   if (res.dry) {
@@ -415,8 +490,7 @@ function fireWeapon(dt) {
   camera.getWorldDirection(_dir);
   _muzzle.set(player.x, player.groundY + 1.5, player.z).addScaledVector(_dir, 0.8);
   for (let i = 0; i < res.pellets; i++) {
-    const d = jitterDir(_dir, w.spread, new THREE.Vector3());
-    resolveShot(w, camera.position, d);
+    resolveShot(w, camera.position, jitterDir(_dir, w.spread, new THREE.Vector3()));
   }
   traffic.panicNear(player.x, player.z, 34);
   // Gunfire is a crime only when someone is close enough to hear it.
@@ -425,6 +499,10 @@ function fireWeapon(dt) {
   if (witnessed) crime(w.id === 'fists' ? 0 : 3, 'discharge');
 }
 
+/**
+ * Resolve one shot: find the nearest thing the ray touches (world, pedestrian,
+ * traffic car, cruiser or the rival), draw a tracer to it and apply the effect.
+ */
 function resolveShot(w, o, d) {
   let bestT = rayBuildings(o, d, w.range);
   let kind = 'world', obj = null;
@@ -479,6 +557,7 @@ function resolveShot(w, o, d) {
   }
 }
 
+/** Melee swing: hit the closest thing in front of the player within reach. */
 function melee() {
   if (player.meleeCooldown > 0) return;
   player.meleeCooldown = 0.42;
@@ -520,22 +599,24 @@ function melee() {
   camRig.shake = Math.max(camRig.shake, 0.25);
 }
 
-// ---- crimes and wanted -----------------------------------------------------
+// ===========================================================================
+// Crimes and the wanted system
+// ===========================================================================
 function crime(amount, reason) {
   if (amount <= 0) return;
   const before = police.wanted;
   const r = police.crime(amount, reason, player.x, player.z);
-  if (r.raised && r.to > before) {
-    missions.save.bestWanted = Math.max(missions.save.bestWanted, r.to);
-    mctx.wantedPeak = Math.max(mctx.wantedPeak, r.to);
-    hud.center('WANTED ' + '★'.repeat(r.to), wantedLine(r.to), 'gold', 2.4);
-    sound.radioBlip();
-    if (r.to >= 3) hud.ticker('PORT AZUL PD', 'P', 'All units: suspect is armed and dangerous. Use of force authorised.');
-    if (r.to >= 5) hud.ticker('PORT AZUL PD', 'P', 'Armoured response rolling. Air support overhead.');
-    missions.persist();
-  }
+  if (!r.raised || r.to <= before) return;
+  missions.save.bestWanted = Math.max(missions.save.bestWanted, r.to);
+  mctx.wantedPeak = Math.max(mctx.wantedPeak, r.to);
+  hud.center('WANTED ' + '★'.repeat(r.to), wantedLine(r.to), 'gold', 2.4);
+  sound.radioBlip();
+  if (r.to >= 3) hud.ticker('PORT AZUL PD', 'P', 'All units: suspect is armed and dangerous. Use of force authorised.');
+  if (r.to >= 5) hud.ticker('PORT AZUL PD', 'P', 'Armoured response rolling. Air support overhead.');
+  missions.persist();
 }
 
+/** The line under a wanted banner: the flavour of each star count. */
 function wantedLine(to) {
   return to === 1 ? 'A patrol noticed. Keep moving.'
     : to === 2 ? 'Cruisers inbound. A roadblock is being set.'
@@ -544,7 +625,10 @@ function wantedLine(to) {
           : 'Maximum response. Survive.';
 }
 
-// ---- interactions ----------------------------------------------------------
+// ===========================================================================
+// Interactions: entering, exiting and stealing rides
+// ===========================================================================
+/** The nearest rideable car, preferring the player's own if it is close. */
 function nearestRide() {
   let best = null, bestD = 5.2;
   if (player.car) {
@@ -557,7 +641,11 @@ function nearestRide() {
 }
 
 function onEnterExit() {
-  if (player.inCar) { player.exitCar(); sound.click(); return; }
+  if (player.inCar) {
+    player.exitCar();
+    sound.click();
+    return;
+  }
   const ride = nearestRide();
   if (!ride) { sound.denied(); return; }
   if (ride.hero) {
@@ -573,6 +661,7 @@ function onEnterExit() {
   city.addHeadlights(player.car);
 }
 
+/** Force a steal of a traffic car even when the hero car is nearer. */
 function onSteal() {
   if (player.inCar) return;
   const ride = nearestRide();
@@ -585,6 +674,7 @@ function onSteal() {
   sound.engineStart();
 }
 
+/** The interaction prompt, reflecting what E / F would do right now. */
 function promptText() {
   if (state !== 'play') return '';
   if (player.inCar) return 'E — EXIT · H — HORN · C — CAMERA';
@@ -593,13 +683,17 @@ function promptText() {
   return ride.hero ? 'E — DRIVE' : (ride.parked ? 'E — ENTER · F — STEAL' : 'F — CAR-JACK');
 }
 
-// ---- missions --------------------------------------------------------------
+// ===========================================================================
+// Missions
+// ===========================================================================
+/** Who gives the current job; their name and avatar letter decorate the HUD. */
 function missionGiver() {
   const id = missions.mission().id;
   return id === 'delivery' || id === 'port' ? 'LOURDES' : 'ROXY';
 }
 function missionAvatar() { return missionGiver() === 'LOURDES' ? 'L' : 'R'; }
 
+/** Feed the mission runner the live context and act on any transition. */
 function updateMissions(dt) {
   const st = missions.stage();
   if (st && st.target === 'ram' && !traffic.rival) {
@@ -645,7 +739,8 @@ function updateMissions(dt) {
     nextMissionTimer -= dt;
     if (nextMissionTimer <= 0) {
       if (missions.nextMission()) {
-        cleanArmed = false; ramHits = 0;
+        cleanArmed = false;
+        ramHits = 0;
         hud.center(missions.mission().name, missions.mission().brief, '', 3.0);
       }
     }
@@ -660,16 +755,23 @@ function updateMissions(dt) {
   }
 }
 
+/** A new stage began: announce it and arm the clean-stage rule. */
 function onStage() {
   const st = missions.stage();
   sound.mission();
   hud.center(st.name, st.obj, '', 2.4);
   if (st.target === 'clean') cleanArmed = false;
-  if (st.target === 'ram') { ramHits = 0; hud.ticker('ROXY', 'R', 'Ram their car three times. Do not let them get away.'); }
-  else if (st.target === 'five') hud.ticker('LOURDES', 'L', 'Five stars? You are either a legend or a fool, Marlow.');
-  else hud.ticker(missionGiver(), missionAvatar(), st.obj);
+  if (st.target === 'ram') {
+    ramHits = 0;
+    hud.ticker('ROXY', 'R', 'Ram their car three times. Do not let them get away.');
+  } else if (st.target === 'five') {
+    hud.ticker('LOURDES', 'L', 'Five stars? You are either a legend or a fool, Marlow.');
+  } else {
+    hud.ticker(missionGiver(), missionAvatar(), st.obj);
+  }
 }
 
+/** The job paid out: announce the reward and queue the next one. */
 function onMissionComplete() {
   const m = missions.mission();
   sound.mission();
@@ -680,7 +782,9 @@ function onMissionComplete() {
   else nextMissionTimer = 3.0;
 }
 
-// ---- spikes, roadblocks, tank ----------------------------------------------
+// ===========================================================================
+// Hazards: spike strips, the armoured truck and running people down
+// ===========================================================================
 function checkHazards() {
   if (police.checkSpikes(player.x, player.z) && player.inCar) {
     player.tiresPopped = true;
@@ -696,7 +800,6 @@ function checkHazards() {
     hud.damageFlash(0.5);
     if (dead) endGame('wasted');
   }
-  // Run-down pedestrians.
   if (player.inCar && Math.abs(player.speed) > 4) {
     for (const p of traffic.peds) {
       if (p.dead) continue;
@@ -712,7 +815,9 @@ function checkHazards() {
   }
 }
 
-// ---- screens ---------------------------------------------------------------
+// ===========================================================================
+// Screens
+// ===========================================================================
 function showScreen(name) {
   for (const id of ['startScreen', 'pauseScreen', 'endScreen', 'phoneScreen']) {
     $(id).classList.toggle('hidden', id !== name);
@@ -720,6 +825,7 @@ function showScreen(name) {
   $('app').classList.toggle('menu', name !== null);
 }
 
+/** The pause / end statistics block. */
 function statsHtml() {
   const best = missions.save.bestWanted;
   const rs = runStats();
@@ -729,6 +835,7 @@ function statsHtml() {
     + `<b>CITY</b> ${city.countColliders()} FOOTPRINTS · <b>FPS</b> ${fps}`;
 }
 
+/** Begin a run: reset the world, park the hero car and hand over control. */
 function startPlay(index = null) {
   if (index !== null) missions.setMission(index);
   missions.done = false;
@@ -790,6 +897,7 @@ function togglePhone() {
   }
 }
 
+/** Death or arrest: freeze the world, print the ending and offer a restart. */
 function endGame(kind) {
   if (state === 'end') return;
   state = 'end';
@@ -809,13 +917,17 @@ function endGame(kind) {
   missions.persist();
 }
 
-// ---- phone -----------------------------------------------------------------
+// ===========================================================================
+// Phone and title-screen mission list
+// ===========================================================================
 const CONTACTS = [
   { name: 'ROXY', avatar: 'R', text: 'Keys are in the courier van. Bring it back in one piece, Marlow.' },
   { name: 'LOURDES', avatar: 'L', text: 'The manifest is in the crane office. In and out, mijo.' },
   { name: 'PORT AZUL PD', avatar: 'P', text: 'Dispatch: suspect last seen on Neon Avenue. Units en route.' },
   { name: 'RIVAL CREW', avatar: 'X', text: 'You run these streets? Cute. The docks belong to us now.' },
 ];
+
+/** Rebuild the phone's contact list; each row plays a message and closes. */
 function buildPhone() {
   const el = $('phoneList');
   el.innerHTML = '';
@@ -837,7 +949,7 @@ function buildPhone() {
 }
 buildPhone();
 
-// ---- mission list on the title screen --------------------------------------
+/** The title screen lists every job; a finished one is marked done. */
 function buildMissionList() {
   const el = $('missionList');
   el.innerHTML = '';
@@ -851,13 +963,17 @@ function buildMissionList() {
   });
 }
 
-// ---- HUD -------------------------------------------------------------------
+// ===========================================================================
+// HUD
+// ===========================================================================
+/** The radio line under the speedometer; off in the car there is no radio. */
 function radioLine() {
   if (!player.inCar) return 'ON FOOT · RADIO OFF';
   const stations = ['KNEON 98.5 — SYNTHWAVE', 'WAVE 103 — COASTAL POP', 'RADIO PUERTO — SALSA', 'KOLD 92 — CLASSIC ROCK'];
   return stations[Math.floor(simTime / 40) % stations.length];
 }
 
+/** Push every live value to the HUD; called while play, pause or phone shows. */
 function updateHud() {
   const m = missions.mission();
   const st = missions.stage();
@@ -867,10 +983,10 @@ function updateHud() {
     missions.save.money, player.health, player.armour, player.stamina,
     arsenal.current(), arsenal.currentAmmo(), missions.save.rank, missions.save.respect);
   hud.setSlots(arsenal.index, arsenal.owned);
-  // A dry weapon is called out on the HUD rather than only by the click sound.
   hud.setDryFire(!arsenal.hasLiveWeapon);
   hud.setDispatch(police.dispatchList(player.x, player.z));
-  hud.setSpeed(player.inCar ? player.speedKmh() : 0, player.inCar ? player.carName : 'ON FOOT', player.enginePct, radioLine());
+  hud.setSpeed(player.inCar ? player.speedKmh() : 0, player.inCar ? player.carName : 'ON FOOT',
+    player.enginePct, radioLine());
   hud.setClock(clockMin);
   hud.setMarkerDist(mctx.markerDist);
   const loc = city.locationAt(player.x, player.z);
@@ -883,13 +999,16 @@ function updateHud() {
   const blips = [];
   for (const c of police.cruisers) if (!c.disabled) blips.push({ x: c.x, z: c.z });
   if (police.tank) blips.push({ x: police.tank.x, z: police.tank.z });
-  hud.drawMinimap(player.x, player.z, player.heading, blips, missions.marker,
+  hud.drawMinimap(
+    player.x, player.z, player.heading, blips, missions.marker,
     police.heli ? { x: police.heli.mesh.position.x, z: police.heli.mesh.position.z } : null,
     police.roadblock ? { x: police.roadblock.x, z: police.roadblock.z, heading: police.roadblock.heading } : null);
 }
 
-// ---- input -----------------------------------------------------------------
-/** Keys that work in every state: mute, phone, pause. */
+// ===========================================================================
+// Input routing
+// ===========================================================================
+/** Keys that work in every state: mute, phone and pause. */
 function handleMetaInput() {
   if (input.pressed('KeyM')) {
     muted = !muted;
@@ -900,6 +1019,7 @@ function handleMetaInput() {
   if (input.pressed('KeyP') || (input.pressed('Escape') && !input.locked)) togglePause();
 }
 
+/** Play-state keys and the trigger. */
 function handleInput(dt) {
   if (state !== 'play') return;
 
@@ -909,7 +1029,7 @@ function handleInput(dt) {
   if (input.pressed('KeyH')) sound.honk();
   if (input.pressed('KeyQ')) melee();
   if (input.pressed('KeyR')) { if (arsenal.startReload()) sound.click(); }
-  // The mouse wheel cycles the owned weapons, the way a weapon wheel should.
+  // The wheel cycles owned weapons, the way a weapon wheel should.
   const wheel = input.takeWheel();
   if (wheel) {
     if (arsenal.cycle(wheel > 0 ? 1 : -1)) sound.click();
@@ -928,15 +1048,13 @@ function handleInput(dt) {
   if (input.released('MouseLeft')) arsenal.endClick();
 }
 
-// ---- per-frame simulation --------------------------------------------------
+// ===========================================================================
+// One simulation step
+// ===========================================================================
 function step(dt) {
   simTime += dt;
   clockMin = (clockMin + dt * timeScale) % 1440;
-  const s = sunEnv(clockMin);
-  env.day = s.day;
-  env.dusk = s.dusk;
-  env.sunDir.copy(s.sunDir);
-  env.focus.set(player.x, player.groundY + 1.6, player.z);
+  applySunEnv();
 
   handleInput(dt);
 
@@ -976,11 +1094,11 @@ function step(dt) {
   sound.setEngine(player.inCar ? player.speedKmh() : 0, player.inCar);
   sound.setSiren(police.wanted > 0, police.nearestPoliceDist(player.x, player.z) < 90, police.wanted);
   sound.radioTick(dt, player.inCar);
-  // Tyre screech while the handbrake is sliding the car.
   sound.setScreech(player.inCar && player.handbrakeSlide ? Math.min(1, Math.abs(player.speed) / 22) : 0);
 
   if (player.health <= 0) endGame('wasted');
   else if (police.arrest >= 1) endGame('busted');
+
   // A wrecked, stopped ride with no heat is a dead end, not a fail state: say
   // so once and let the player step out, so the session continues instead of
   // stalling in a car that can no longer move.
@@ -995,13 +1113,14 @@ function step(dt) {
   }
 }
 
-// Police gunfire damages the player through a callback set here.
+// ---- callbacks the systems raise into the game ------------------------------
+// Officer gunfire damages the player.
 police.onShoot = (dmg) => {
   const dead = player.damage(dmg, 'gunfire');
   hud.damageFlash(0.4);
   if (dead) endGame('wasted');
 };
-// A cruiser PIT or a heavy bump damages the player's car and shakes the camera.
+// A cruiser PIT or a heavy bump damages the ride and shakes the camera.
 police.onRam = (dmg) => {
   if (player.inCar) {
     player.damage(dmg, 'pit');
@@ -1016,9 +1135,9 @@ police.onRam = (dmg) => {
   }
 };
 
-// ---- the loop --------------------------------------------------------------
-const STEP = 1 / 60;
-const MAX_FRAME = 0.25;
+// ===========================================================================
+// The loop
+// ===========================================================================
 let last = performance.now();
 let accumulator = 0;
 
@@ -1038,22 +1157,20 @@ function frame(now) {
   handleMetaInput();
 
   if (state === 'play') {
+    // Fixed-step simulation: several steps in a slow frame, none in a fast one.
     accumulator += dt;
     let n = 0;
-    while (accumulator >= STEP && n < 5) {
+    while (accumulator >= STEP && n < MAX_STEPS_PER_FRAME) {
       step(STEP);
       accumulator -= STEP;
       n++;
       if (state !== 'play') { accumulator = 0; break; }
     }
-    if (n === 5) accumulator = 0;
+    if (n === MAX_STEPS_PER_FRAME) accumulator = 0;
   } else if (state === 'title' || state === 'end') {
+    // The menu keeps the city alive: traffic rolls, the clock does not advance.
     idleTime += dt;
-    const s = sunEnv(clockMin);
-    env.day = s.day;
-    env.dusk = s.dusk;
-    env.sunDir.copy(s.sunDir);
-    env.focus.set(player.x, player.groundY + 1.6, player.z);
+    applySunEnv();
     traffic.update(dt, player, false, player.inCar);
     city.update(dt, idleTime, env);
     updateMarker(dt);
@@ -1068,10 +1185,11 @@ function frame(now) {
   fill.intensity = 0.62 - 0.3 * env.day;
   if (state === 'play' || state === 'pause' || state === 'phone') updateHud();
   hud.update(dt);
-  // The menu clock tracks the (idle-advancing) time of day too.
-  if (state === 'title' || state === 'end') paintTitleClock();
+  if (state === 'title' || state === 'end') paintClocks();
   renderer.render(scene, camera);
-  if (!bootHidden) { bootHidden = true; bootEl?.classList.add('gone'); }
+
+  const bootEl = $('boot');
+  if (bootEl && !bootEl.classList.contains('gone')) bootEl.classList.add('gone');
 
   input.beginFrame();
   input.endFrame();
@@ -1082,7 +1200,9 @@ function frame(now) {
   }
 }
 
-// ---- wiring ----------------------------------------------------------------
+// ===========================================================================
+// Wiring the screens
+// ===========================================================================
 $('playBtn').onclick = () => { sound.ensure(); sound.click(); startPlay(0); };
 $('continueBtn').onclick = () => { sound.ensure(); sound.click(); startPlay(); };
 $('resumeBtn').onclick = () => { sound.click(); togglePause(); };
@@ -1090,7 +1210,8 @@ $('restartBtn').onclick = () => {
   sound.click();
   missions.restartMission();
   police.reset();
-  cleanArmed = false; ramHits = 0;
+  cleanArmed = false;
+  ramHits = 0;
   state = 'play';
   showScreen(null);
   input.lock();
@@ -1101,8 +1222,11 @@ $('resetBtn').onclick = () => {
   missions.resetSave();
   police.reset();
   arsenal.reset();
-  player.health = 100; player.armour = 40; player.stamina = 100;
-  cleanArmed = false; ramHits = 0;
+  player.health = 100;
+  player.armour = 40;
+  player.stamina = 100;
+  cleanArmed = false;
+  ramHits = 0;
   state = 'play';
   showScreen(null);
   input.lock();
@@ -1131,17 +1255,20 @@ canvas.addEventListener('mousedown', () => {
   if (state === 'play' && !input.locked) input.lock();
 });
 document.addEventListener('pointerlockchange', () => {
-  // Losing the pointer (ESC) pauses the game rather than leaving it running.
+  // Losing the pointer (ESC) pauses rather than leaving the game running.
   if (!document.pointerLockElement && state === 'play') togglePause();
 });
 
 buildMissionList();
 showScreen('startScreen');
 
-// ---- screenshot presets ----------------------------------------------------
-/** Fixed steps a staged shot runs before it is captured, so a preset is a
+// ===========================================================================
+// Screenshot presets
+// ===========================================================================
+/** Fixed steps a staged shot settles before it is captured, so a preset is a
  *  deterministic scene rather than whatever the first frames happened to show. */
 const SHOT_SETTLE_STEPS = 110;
+
 const SHOTS = {
   start: {
     screen: 'title', time: 18 * 60 + 45, pos: [30, 96],
@@ -1161,9 +1288,8 @@ const SHOTS = {
   docks: {
     screen: 'none', time: 17 * 60 + 12, pos: [-228, 8],
     // South of the player looking north across the yard: the near gantry
-    // crane's two legs and beam fill the left of frame, the container stacks
-    // the right, and the quay wall sits behind the camera so it does not eat
-    // the foreground.
+    // crane's legs and beam fill the left of frame, the container stacks the
+    // right, and the quay wall sits behind the camera.
     cam: { dist: 15, pitch: 0.12, spin: 0.02, yaw: 0, look: 2.0 },
   },
   night: {
@@ -1172,17 +1298,12 @@ const SHOTS = {
   },
 };
 
-/** True when a walker could stand at (x,z) — clear of buildings and surf. */
+/** True when a walker could stand at (x,z): clear of buildings and surf. */
 function standable(x, z) {
   return !city.hitsBuilding(x, z, 1.1) && !city.isWater(x, z);
 }
 
-/**
- * Nudge a staged position out of a footprint. The port is full of container
- * stacks, and a preset that lands inside one puts the camera inside the
- * player's head, so the preset is a hint and this search finds the nearest
- * clear ground.
- */
+/** Nudge a staged position out of a footprint; the port is full of containers. */
 function clearSpot(x, z) {
   if (standable(x, z)) return [x, z];
   for (let r = 3; r <= 30; r += 3) {
@@ -1195,12 +1316,12 @@ function clearSpot(x, z) {
   return [x, z];
 }
 
+/** Build one preset scene, settle it, paint it once and mark it ready. */
 function applyShot(name) {
   const s = SHOTS[name];
   if (!s) return false;
   if (s.time != null) clockMin = s.time;
-  paintClock();
-  paintTitleClock();
+  paintClocks();
   freeCam = s.cam || null;
   $('app').classList.add('shot');
   if (s.screen === 'title') {
@@ -1213,8 +1334,7 @@ function applyShot(name) {
   }
   police.reset();
   if (s.park) {
-    // A parked hero car stays in the frame (the boardwalk shot is staged with
-    // one); spawnCar steps straight out of it again.
+    // A parked hero car stays in frame; spawnCar steps straight out of it.
     player.spawnCar(s.park[0], s.park[1], s.park[2]);
     player.exitCar();
   }
@@ -1242,23 +1362,22 @@ function applyShot(name) {
   if (s.units) {
     for (const [ux, uz] of s.units) police.spawnCruiser(player.x, player.z, { x: ux, z: uz });
   }
-  /** A staged shot settles immediately: one environment pass with the pinned
-   *  clock, so stars, lamp pools and window glow are in place on frame one. */
-  const envNow = sunEnv(clockMin);
-  env.day = envNow.day;
-  env.dusk = envNow.dusk;
-  env.sunDir.copy(envNow.sunDir);
+  // One environment pass with the pinned clock, so stars, lamp pools and
+  // window glow are in place on the first painted frame.
+  applySunEnv();
   city.update(0.016, simTime, env);
   // Put the camera straight on its subject so the first frame is framed.
   camRig.pos.set(player.x + 10, player.groundY + 6, player.z + 14);
   camRig.look.set(player.x, player.groundY + 1.6, player.z);
   // The title preset keeps its menu orbit; everything else settles for real.
-  if (s.screen === 'title') { shotFrames = 24; return true; }
-  // Run the actual fixed-step simulation for a moment and let the camera rig
-  // catch up, then paint once. The captured frame is the same whether the tab
-  // managed one rAF tick or a thousand, which is what makes the four shots in
-  // screenshots/ reproducible from a ?shot= query alone. The clock is pinned
-  // while it runs, so ?time=HH:MM is the hour on the clock in the picture.
+  if (s.screen === 'title') {
+    shotFrames = 24;
+    return true;
+  }
+  // Run the actual fixed-step simulation for a moment with the clock pinned,
+  // then paint once: the captured frame is the same whether the tab managed one
+  // rAF tick or a thousand, which is what makes the screenshots reproducible
+  // from a ?shot= query alone.
   const savedTimeScale = timeScale;
   timeScale = 0;
   for (let i = 0; i < SHOT_SETTLE_STEPS; i++) {
@@ -1275,7 +1394,9 @@ function applyShot(name) {
 const shotName = params.get('shot');
 if (shotName) applyShot(shotName);
 
-// ---- debug handle ----------------------------------------------------------
+// ===========================================================================
+// Debug / test handle
+// ===========================================================================
 window.__game = {
   get state() { return state; },
   get fps() { return fps; },
@@ -1294,8 +1415,7 @@ window.__game = {
   /** Pin the clock (minutes since midnight) — used by the screenshot presets. */
   setClock(minutes) {
     clockMin = ((minutes % 1440) + 1440) % 1440;
-    paintClock();
-    paintTitleClock();
+    paintClocks();
   },
   /** Toggle the wanted level directly, for staged screenshots. */
   setWanted(stars) {
@@ -1315,4 +1435,5 @@ window.__game = {
     }
   },
 };
+
 requestAnimationFrame(frame);

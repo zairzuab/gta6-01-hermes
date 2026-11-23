@@ -6,7 +6,7 @@
     "description": "On foot on the beachfront road at dusk: the hero Brisa GT parked beside Marlow, the boardwalk Ferris wheel and the neon strip behind, palms and beach umbrellas along the sand.",
     "width": 1280,
     "height": 800,
-    "bytes": 124608
+    "bytes": 115112
   },
   {
     "name": "2-play.jpg",
@@ -15,7 +15,7 @@
     "description": "Behind the wheel of the Brisa GT on Neon Avenue at dusk: palm-lined sidewalks, the PAWN shop and the diner awning, traffic and lit windows down the strip.",
     "width": 1280,
     "height": 800,
-    "bytes": 166025
+    "bytes": 153637
   },
   {
     "name": "3-chase.jpg",
@@ -24,7 +24,7 @@
     "description": "A three-star night pursuit on the Strip: three wanted stars lit, cruisers and the air unit on dispatch, a marked cruiser boxing the Brisa GT in on the right.",
     "width": 1280,
     "height": 800,
-    "bytes": 166047
+    "bytes": 150960
   },
   {
     "name": "4-docks.jpg",
@@ -33,6 +33,6 @@
     "description": "The container port in the afternoon: Marlow on the quay, a gantry crane straddling the stacked containers behind, the port yard under a pale sky.",
     "width": 1280,
     "height": 800,
-    "bytes": 110936
+    "bytes": 110896
   }
 ]
