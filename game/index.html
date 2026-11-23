@@ -3,17 +3,350 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Block Dodger</title>
+<meta name="theme-color" content="#05080f">
+<meta name="color-scheme" content="dark">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2305080f'/%3E%3Ctext x='16' y='23' font-family='Arial' font-size='19' font-weight='900' fill='%235ff2ff' text-anchor='middle'%3EPA%3C/text%3E%3C/svg%3E">
+<meta name="description" content="PORT AZUL — Neon Tide: an original 3D open-world crime game. Drive, steal, shoot and outrun a five-star police response across a procedural coastal city.">
+<title>PORT AZUL — Neon Tide</title>
 <style>
-  html, body { margin: 0; height: 100%; overflow: hidden; background: #11141b; }
-  #game { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
-  /* Read aloud, never shown: the status line screen readers announce. */
-  #status { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  :root {
+    --cyan: #5ff2ff; --pink: #ff5da0; --gold: #ffd75e; --green: #7dffa8;
+    --red: #ff4d5e; --ink: #05080f;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: var(--ink);
+    font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif; color: #fff;
+    overscroll-behavior: none; }
+  #app { position: fixed; inset: 0; }
+  /* Touch drives the camera and the handbrake; the page must not pan or
+     rubber-band underneath a swipe. */
+  #scene { position: absolute; inset: 0; width: 100%; height: 100%; display: block;
+    touch-action: none; }
+
+  .hud { position: absolute; color: #fff; text-shadow: 0 1px 3px rgba(0,0,0,.9);
+    user-select: none; pointer-events: none; z-index: 5; }
+  .panel { background: linear-gradient(160deg, rgba(7,12,24,.78), rgba(7,12,24,.62));
+    border: 1px solid rgba(255,255,255,.13); border-radius: 8px; padding: 9px 11px;
+    box-shadow: 0 4px 18px rgba(0,0,0,.45); }
+
+  /* ---- top-left mission card ---- */
+  #mission { top: 12px; left: 12px; width: 306px; }
+  #mission .m-count { font-size: 10.5px; letter-spacing: 2.4px; color: var(--cyan); font-weight: 700; }
+  #mission .m-name { font-size: 23px; font-weight: 900; letter-spacing: .8px; line-height: 1.06; margin-top: 1px; }
+  #mission .m-stage { margin-top: 5px; font-size: 11px; color: #cfe3ff; letter-spacing: .3px; }
+  #mission .m-stage b { color: var(--cyan); }
+  #mission .m-bar { height: 5px; background: rgba(255,255,255,.18); border-radius: 3px; margin-top: 5px; overflow: hidden; }
+  #mission .m-bar > div { height: 100%; background: linear-gradient(90deg, var(--cyan), #b6f6ff); width: 25%; transition: width .25s; }
+  #mission .m-obj { margin-top: 6px; font-size: 12.5px; line-height: 1.35; color: #f2f6ff; }
+  #mission .m-reward { float: right; color: var(--gold); font-weight: 800; font-size: 12px; }
+
+  /* ---- top-right wanted + vitals ---- */
+  #stats { top: 12px; right: 12px; width: 274px; }
+  #stats .wanted { display: flex; justify-content: space-between; align-items: baseline; }
+  #stats .wanted .w-label { font-size: 11.5px; letter-spacing: 2.4px; color: #ffb3b3; font-weight: 700; }
+  #stars { font-size: 19px; letter-spacing: 2.5px; line-height: 1; }
+  #stars .on { color: var(--gold); text-shadow: 0 0 8px rgba(255,215,94,.55); }
+  #stars .off { color: rgba(255,255,255,.26); }
+  #stats .sight { font-size: 11px; font-weight: 700; text-align: right; letter-spacing: .5px; }
+  #stats .money { font-size: 24px; font-weight: 900; color: var(--green); margin-top: 3px; }
+  #stats .money small { font-size: 12px; color: #cfe3ff; font-weight: 600; float: right; margin-top: 9px; }
+  .bar-row { display: flex; align-items: center; gap: 6px; margin-top: 4px; font-size: 10.5px; }
+  .bar-row .lbl { width: 54px; letter-spacing: 1.2px; color: #cfe3ff; font-weight: 700; }
+  .bar { flex: 1; height: 8px; background: rgba(255,255,255,.15); border-radius: 4px; overflow: hidden; }
+  .bar > div { height: 100%; transition: width .12s; }
+  #healthBar { background: linear-gradient(90deg, #ff4d6d, #ff8aa0); width: 100%; }
+  #staminaBar { background: linear-gradient(90deg, #5ff2ff, #b6f6ff); width: 100%; }
+  #armourBar { background: linear-gradient(90deg, #4da3ff, #9cc8ff); width: 0%; }
+  .bar-row .val { width: 26px; text-align: right; font-weight: 700; font-size: 11px; }
+  #weaponLine { margin-top: 7px; font-size: 13px; font-weight: 800; letter-spacing: .4px;
+    display: flex; justify-content: space-between; align-items: baseline; }
+  #weaponLine .ammo { color: var(--gold); font-size: 12px; }
+  #rankLine { font-size: 10.5px; color: var(--gold); margin-top: 2px; letter-spacing: .6px; }
+  #slots { display: flex; gap: 5px; margin-top: 7px; }
+  .slot { flex: 1; height: 35px; background: rgba(255,255,255,.09); border: 1px solid rgba(255,255,255,.15);
+    border-radius: 5px; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    font-size: 9px; color: #cfe3ff; gap: 1px; }
+  .slot .ic { font-size: 15px; line-height: 1; }
+  .slot.active { background: rgba(95,242,255,.88); color: #10151f; border-color: var(--cyan); }
+  .slot .key { font-size: 8px; opacity: .7; }
+
+  /* ---- dispatch list ---- */
+  #dispatch { top: 326px; right: 12px; width: 274px; font-size: 11.5px; }
+  #dispatch .d-head { font-size: 10.5px; letter-spacing: 2.2px; color: #9fd0ff; font-weight: 700;
+    border-bottom: 1px solid rgba(255,255,255,.14); padding-bottom: 4px; margin-bottom: 4px; }
+  #dispatch .unit { display: flex; justify-content: space-between; padding: 2.5px 0; gap: 6px; }
+  #dispatch .unit .call { font-weight: 800; }
+  #dispatch .unit .kind { color: #cfe3ff; }
+  #dispatch .unit .dist { color: var(--gold); font-weight: 700; }
+  #dispatch .unit .st { font-weight: 800; }
+  #dispatch .st.pursuit { color: var(--red); }
+  #dispatch .st.pit { color: #ff9f43; }
+  #dispatch .st.box { color: #ff9f43; }
+  #dispatch .st.air { color: #4da3ff; }
+
+  /* ---- bottom-left minimap ---- */
+  #mapBox { left: 12px; bottom: 12px; width: 222px; }
+  #minimap { width: 202px; height: 202px; border-radius: 50%;
+    border: 3px solid rgba(255,255,255,.72); background: #0d1a2e; display: block;
+    box-shadow: 0 3px 12px rgba(0,0,0,.6), inset 0 0 20px rgba(0,0,0,.5); }
+  #locName { margin-top: 6px; font-size: 14.5px; font-weight: 900; letter-spacing: .6px; }
+  #locName small { display: block; font-size: 10.5px; color: var(--cyan); letter-spacing: 1.2px; font-weight: 700; }
+
+  /* ---- bottom-right speedometer ---- */
+  #speedo { right: 12px; bottom: 12px; width: 216px; text-align: right; }
+  #speedVal { font-size: 42px; font-weight: 900; line-height: .95; letter-spacing: -1px; }
+  #speedVal small { font-size: 13px; color: #cfe3ff; font-weight: 700; }
+  #carName { font-size: 14px; font-weight: 800; letter-spacing: 1.2px; }
+  #engineRow { margin-top: 4px; display: flex; align-items: center; gap: 6px; }
+  #engineRow .bar { flex: 1; }
+  #engineRow .bar > div { background: linear-gradient(90deg, #ffd75e, #ffe9a0); }
+  #radioLine { font-size: 10.5px; color: #cfe3ff; margin-top: 5px; letter-spacing: .4px; }
+  /* On foot the engine gauge is not applicable: it swaps to a sprint/stamina
+     readout so the panel never shows a lie. */
+  #speedo.onfoot #engineRow { display: none; }
+  #speedo.onfoot #carName { color: var(--cyan); }
+
+  /* ---- bottom-center radio ticker ---- */
+  #ticker { left: 50%; bottom: 14px; transform: translateX(-50%); width: 520px; max-width: 44vw;
+    display: flex; gap: 10px; align-items: center; }
+  #ticker .avatar { width: 42px; height: 42px; border-radius: 7px; flex: none;
+    display: flex; align-items: center; justify-content: center; font-size: 21px; font-weight: 900; color: #fff;
+    background: linear-gradient(150deg, #b84ad8, #6a3ad8); box-shadow: 0 2px 10px rgba(0,0,0,.5); }
+  #ticker .t-name { color: var(--green); font-weight: 800; font-size: 11.5px; letter-spacing: .8px; }
+  #ticker .t-text { font-size: 12.5px; line-height: 1.28; }
+
+  /* ---- center messages ---- */
+  #centerMsg { left: 50%; top: 20%; transform: translateX(-50%); text-align: center; width: 700px; }
+  #centerMsg .big { font-size: 40px; font-weight: 900; letter-spacing: 3.5px; color: var(--cyan);
+    text-shadow: 0 0 26px rgba(95,242,255,.45), 0 2px 6px rgba(0,0,0,.8); }
+  #centerMsg .sub { font-size: 15px; color: #fff; margin-top: 5px; text-shadow: 0 2px 6px rgba(0,0,0,.8); }
+  #centerMsg .big.red { color: var(--red); text-shadow: 0 0 26px rgba(255,77,94,.5), 0 2px 6px rgba(0,0,0,.8); }
+  #centerMsg .big.gold { color: var(--gold); text-shadow: 0 0 26px rgba(255,215,94,.45), 0 2px 6px rgba(0,0,0,.8); }
+
+  #dmgFlash { position: absolute; inset: 0; pointer-events: none; z-index: 4;
+    box-shadow: inset 0 0 130px rgba(255,0,0,0); transition: box-shadow .16s; }
+
+  /* ---- screens ---- */
+  .screen { position: absolute; inset: 0; z-index: 10; display: flex; align-items: center;
+    justify-content: center; background: radial-gradient(ellipse at 50% 35%, rgba(20,30,52,.86), rgba(4,7,14,.94));
+    color: #fff; }
+  .screen.hidden { display: none; }
+  .card { width: 660px; max-width: 92vw; max-height: 92vh; overflow-y: auto;
+    background: linear-gradient(165deg, rgba(11,18,34,.96), rgba(8,13,26,.94));
+    border: 1px solid rgba(95,242,255,.36); border-radius: 13px; padding: 26px 30px;
+    box-shadow: 0 12px 60px rgba(0,0,0,.72); }
+  .card h1 { margin: 0; font-size: 56px; letter-spacing: 4.5px; font-weight: 900; color: var(--cyan); line-height: .98;
+    text-shadow: 0 0 30px rgba(95,242,255,.35); }
+  .card h1 span { color: var(--pink); text-shadow: 0 0 30px rgba(255,93,160,.4); }
+  .card h2 { margin: 4px 0 0; font-size: 14px; letter-spacing: 5.5px; color: #9fd0ff; font-weight: 700; }
+  .card p { font-size: 14px; line-height: 1.52; color: #dfe8ff; }
+  .card .missions { margin: 12px 0 4px; }
+  .card .missions .mi { display: flex; justify-content: space-between; align-items: center; gap: 10px;
+    padding: 8px 11px; border: 1px solid rgba(255,255,255,.13); border-radius: 7px; margin-top: 6px;
+    font-size: 13px; cursor: pointer; transition: border-color .15s, background .15s; }
+  .card .missions .mi:hover { border-color: var(--cyan); background: rgba(95,242,255,.07); }
+  .card .missions .mi.done { color: var(--green); }
+  .card .missions .mi .tag { color: var(--gold); font-weight: 800; white-space: nowrap; }
+  .card .keys { font-size: 12.5px; line-height: 1.85; color: #cfe3ff; }
+  .card .keys b { color: #fff; background: rgba(255,255,255,.13); border-radius: 4px; padding: 1px 6px; }
+  .btn { display: inline-block; margin-top: 15px; background: var(--cyan); color: #10151f; font-weight: 900;
+    font-size: 16px; letter-spacing: 1.2px; border: none; border-radius: 8px; padding: 13px 28px; cursor: pointer;
+    transition: background .15s, transform .1s; }
+  .btn:hover { background: #a5f5ff; transform: translateY(-1px); }
+  .btn.ghost { background: transparent; color: #fff; border: 1px solid rgba(255,255,255,.38); margin-left: 8px; }
+  #help { position: absolute; right: 12px; bottom: 200px; font-size: 11px; color: rgba(255,255,255,.78);
+    text-align: right; line-height: 1.62; }
+  #help b { color: var(--cyan); }
+  #crosshair { position: absolute; left: 50%; top: 50%; width: 22px; height: 22px; margin: -11px 0 0 -11px;
+    z-index: 6; pointer-events: none; display: none; }
+  #crosshair::before, #crosshair::after { content: ""; position: absolute; background: #fff; box-shadow: 0 0 3px #000; }
+  #crosshair::before { left: 10px; top: 0; width: 2px; height: 22px; }
+  #crosshair::after { left: 0; top: 10px; width: 22px; height: 2px; }
+  #fpsTag { position: absolute; left: 12px; top: 50%; font-size: 10px; color: rgba(255,255,255,.42); }
+  /* The low-health vignette lives on #dmgFlash; a dry weapon's slot border is
+     set from JS. Both are the only elements the game recolours directly. */
+  #app.lowhealth #dmgFlash { box-shadow: inset 0 0 130px rgba(255,0,0,.22); }
+  .vignette { position: absolute; inset: 0; pointer-events: none; z-index: 3;
+    box-shadow: inset 0 0 180px rgba(0,0,0,.42); }
+
+  /* ---- interaction prompt, arrest bar, toasts ---- */
+  #app.menu .hud, #app.menu #help, #app.menu #fpsTag { display: none; }
+  /* The title clock is the one overlay that stays up on the menu. */
+  #app.menu #titleClock { display: block; }
+  /* A staged screenshot drops the debug tag, crosshair and key help. */
+  #app.shot #fpsTag, #app.shot #crosshair, #app.shot #help, #app.shot #titleClock { display: none !important; }
+  #prompt { left: 50%; top: 58%; transform: translateX(-50%); font-size: 13px; font-weight: 800;
+    letter-spacing: 1px; color: #fff; background: rgba(7,12,24,.72); border: 1px solid rgba(95,242,255,.5);
+    border-radius: 7px; padding: 7px 14px; display: none; z-index: 6; }
+  #prompt b { color: var(--cyan); }
+  #arrestWrap { left: 50%; top: 64%; transform: translateX(-50%); width: 280px; display: none; z-index: 6;
+    text-align: center; }
+  #arrestWrap .a-label { font-size: 11px; letter-spacing: 3px; color: var(--red); font-weight: 900; margin-bottom: 4px; }
+  #arrestWrap .a-bar { height: 7px; background: rgba(255,255,255,.16); border-radius: 4px; overflow: hidden; }
+  #arrestFill { height: 100%; width: 0%; background: linear-gradient(90deg, #ff4d5e, #ff9f43); }
+  #toast { left: 50%; top: 120px; transform: translateX(-50%); font-size: 13px; font-weight: 800;
+    color: var(--gold); opacity: 0; transition: opacity .3s; z-index: 6; letter-spacing: .6px; }
+
+  /* ---- boot overlay: hides on the first rendered frame ---- */
+  #boot { position: absolute; inset: 0; z-index: 20; display: flex; align-items: center; justify-content: center;
+    background: radial-gradient(ellipse at 50% 35%, #14203a, #04070e); transition: opacity .55s; }
+  #boot.gone { opacity: 0; pointer-events: none; }
+  #boot .boot-card { text-align: center; }
+  #boot .boot-card h1 { font-size: 34px; letter-spacing: 3px; font-weight: 900; color: var(--cyan); margin: 0; }
+  #boot .boot-card h1 span { color: var(--pink); }
+  #boot .boot-card p { font-size: 12px; letter-spacing: 2.5px; color: #9fd0ff; margin: 8px 0 0; }
+  #boot .spin { width: 44px; height: 44px; margin: 16px auto 0; border: 3px solid rgba(95,242,255,.22);
+    border-top-color: var(--cyan); border-radius: 50%; animation: bootspin 1s linear infinite; }
+  @keyframes bootspin { to { transform: rotate(360deg); } }
+  #boot .boot-err { color: var(--red); font-size: 13px; margin-top: 12px; max-width: 420px; }
+  /* A player who asks for less motion gets a static boot mark and no bar or
+     toast transitions; the game itself is unaffected. */
+  @media (prefers-reduced-motion: reduce) {
+    #boot .spin { animation: none; }
+    #mission .m-bar > div, .bar > div, #toast, .card .missions .mi { transition: none; }
+  }
 </style>
+<script type="importmap">
+{ "imports": { "three": "./vendor/three.module.min.js" } }
+</script>
 </head>
 <body>
-<canvas id="game" aria-label="Block Dodger: move the paddle left and right to dodge falling blocks and catch coins"></canvas>
-<p id="status" role="status" aria-live="polite"></p>
+<div id="app">
+  <canvas id="scene" role="img" aria-label="Port Azul: the 3D game view"></canvas>
+  <div class="vignette"></div>
+  <div id="dmgFlash"></div>
+
+  <div id="boot">
+    <div class="boot-card">
+      <h1>PORT <span>AZUL</span></h1>
+      <p>NEON TIDE</p>
+      <div class="spin"></div>
+      <div class="boot-err" id="bootErr"></div>
+    </div>
+  </div>
+
+  <div class="hud panel" id="mission">
+    <div class="m-count" id="mCount">JOB 1 OF 5</div>
+    <div class="m-name" id="mName">SALT &amp; STEEL</div>
+    <div class="m-reward" id="mReward">$8,000</div>
+    <div class="m-stage" id="mStage">STAGE 1 OF 3 · <b>GET ROLLING</b></div>
+    <div class="m-bar"><div id="mBarFill"></div></div>
+    <div class="m-obj" id="mObj">Get behind the wheel.</div>
+  </div>
+
+  <div class="hud panel" id="stats">
+    <div class="wanted"><span class="w-label">WANTED</span><span id="stars"></span></div>
+    <div class="sight" id="sightLine">CLEAN</div>
+    <div class="money"><span id="money">$12,400</span><small id="clock">21:04</small></div>
+    <div class="bar-row"><span class="lbl">HEALTH</span><div class="bar"><div id="healthBar"></div></div><span class="val" id="healthVal">100</span></div>
+    <div class="bar-row"><span class="lbl">STAMINA</span><div class="bar"><div id="staminaBar"></div></div><span class="val" id="staminaVal">100</span></div>
+    <div class="bar-row"><span class="lbl">ARMOUR</span><div class="bar"><div id="armourBar"></div></div><span class="val" id="armourVal">0</span></div>
+    <div id="weaponLine"><span id="weaponName">FISTS</span> <span class="ammo" id="weaponAmmo">—</span></div>
+    <div id="rankLine">RANK 1 · STREET · 0 REP</div>
+    <div id="slots"></div>
+  </div>
+
+  <div class="hud panel" id="dispatch">
+    <div class="d-head">PORT AZUL PD · DISPATCH</div>
+    <div id="dispatchList"></div>
+  </div>
+
+  <div class="hud" id="mapBox">
+    <canvas id="minimap" width="202" height="202"></canvas>
+    <div id="locName">THE STRIP<small>Neon Avenue</small></div>
+  </div>
+
+  <div class="hud" id="speedo">
+    <div id="speedVal">0 <small>KM/H</small></div>
+    <div id="carName">ON FOOT</div>
+    <div id="engineRow"><span style="font-size:10.5px;color:#cfe3ff">ENGINE</span>
+      <div class="bar"><div id="engineBar" style="width:100%"></div></div>
+      <span id="engineVal" style="font-size:10.5px;font-weight:700">100%</span></div>
+    <div id="radioLine">KNEON 98.5 — SYNTHWAVE</div>
+  </div>
+
+  <div class="hud panel" id="ticker">
+    <div class="avatar" id="tickerAvatar">R</div>
+    <div><div class="t-name" id="tickerName">ROXY</div><div class="t-text" id="tickerText">Keys are in the courier van. Bring it back in one piece, Marlow.</div></div>
+  </div>
+
+  <div class="hud" id="centerMsg"><div class="big" id="centerBig"></div><div class="sub" id="centerSub"></div></div>
+
+  <div id="crosshair"></div>
+  <div class="hud" id="prompt"></div>
+  <div class="hud" id="arrestWrap">
+    <div class="a-label">BUSTED</div>
+    <div class="a-bar"><div id="arrestFill"></div></div>
+  </div>
+  <div class="hud" id="toast"></div>
+  <div class="hud" id="help">
+    <b>W A S D</b> drive / walk · <b>SHIFT</b> sprint · <b>SPACE</b> jump / handbrake<br>
+    <b>E</b> enter / exit car · <b>F</b> steal car · <b>Q</b> melee<br>
+    <b>CLICK</b> shoot · <b>R</b> reload · <b>1–5</b> / <b>WHEEL</b> weapon · <b>H</b> horn<br>
+    <b>P</b> pause · <b>M</b> mute · <b>C</b> camera · <b>TAB</b> phone
+  </div>
+  <!-- The clock is also shown on the title screen, so the hour a screenshot was
+       staged at is visible before the first job starts. -->
+  <div class="hud" id="titleClock" style="left:50%;top:12px;transform:translateX(-50%);font-size:12px;letter-spacing:2px;color:#cfe3ff"></div>
+  <div class="hud" id="fpsTag"></div>
+
+  <div class="screen" id="startScreen">
+    <div class="card">
+      <h1>PORT <span>AZUL</span></h1>
+      <h2>NEON TIDE · AN ORIGINAL OPEN-WORLD CRIME GAME</h2>
+      <p>You are <b>Marlow Reyes</b>, a courier with a fast car and a worse temper.
+      Port Azul PD thinks the streets belong to them. Take the jobs, steal the rides,
+      punch and shoot your way through five stars of heat — across a coastal city of
+      neon avenues, a boardwalk Ferris wheel, a cargo port, gas stations and a bridge
+      that catches the sunset.</p>
+      <div class="missions" id="missionList"></div>
+      <div class="keys">
+        <b>W A S D</b> drive / walk &nbsp; <b>SHIFT</b> sprint &nbsp; <b>SPACE</b> jump / handbrake &nbsp; <b>E</b> enter / exit<br>
+        <b>F</b> steal nearest car &nbsp; <b>Q</b> melee &nbsp; <b>CLICK</b> shoot &nbsp; <b>R</b> reload &nbsp; <b>1–5</b> / <b>WHEEL</b> weapon<br>
+        <b>TAB</b> phone &nbsp; <b>P</b> pause &nbsp; <b>M</b> mute &nbsp; <b>C</b> camera &nbsp; progress saves automatically
+      </div>
+      <button class="btn" id="playBtn">▶ START THE ENGINE</button>
+      <button class="btn ghost" id="continueBtn">CONTINUE</button>
+    </div>
+  </div>
+
+  <div class="screen hidden" id="pauseScreen">
+    <div class="card">
+      <h1 style="font-size:40px">PAUSED</h1>
+      <p>Take a breath, Marlow. The heat waits for no one — except right now.</p>
+      <div class="keys" id="pauseStats"></div>
+      <button class="btn" id="resumeBtn">RESUME</button>
+      <button class="btn ghost" id="restartBtn">RESTART JOB</button>
+      <button class="btn ghost" id="quitBtn">QUIT TO MENU</button>
+      <button class="btn ghost" id="resetBtn" style="border-color:rgba(255,77,94,.5);color:#ff8a94">RESET PROGRESS</button>
+    </div>
+  </div>
+
+  <div class="screen hidden" id="endScreen">
+    <div class="card">
+      <h1 style="font-size:40px" id="endTitle">BUSTED</h1>
+      <p id="endText"></p>
+      <div class="keys" id="endStats"></div>
+      <button class="btn" id="againBtn">PLAY AGAIN</button>
+      <button class="btn ghost" id="menuBtn">MAIN MENU</button>
+    </div>
+  </div>
+
+  <div class="screen hidden" id="phoneScreen">
+    <div class="card" style="width:360px;border-radius:22px;padding:18px 16px;background:linear-gradient(170deg,#0b1424,#060a14)">
+      <div style="font-size:11px;letter-spacing:3px;color:#5ff2ff;font-weight:800">REYES · CONTACTS</div>
+      <div id="phoneList" style="margin-top:10px"></div>
+      <button class="btn" id="phoneClose" style="width:100%;margin-top:14px;padding:10px">CLOSE (TAB)</button>
+    </div>
+  </div>
+</div>
+<noscript>
+  <div style="position:absolute;inset:0;z-index:40;background:#04070e;color:#fff;display:flex;align-items:center;justify-content:center;text-align:center;font-family:sans-serif">
+    <div><h1 style="color:#5ff2ff;letter-spacing:3px">PORT AZUL</h1>
+    <p>Neon Tide needs JavaScript and WebGL to run.</p></div>
+  </div>
+</noscript>
 <script type="module" src="./src/main.js"></script>
 </body>
 </html>

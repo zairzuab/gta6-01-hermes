@@ -1,5 +1,38 @@
 [
-  { "name": "1-start.jpg", "query": "?shot=start&seed=1" },
-  { "name": "2-play.jpg", "query": "?shot=play&seed=1" },
-  { "name": "3-end.jpg", "query": "?shot=end&seed=1" }
+  {
+    "name": "1-boardwalk.jpg",
+    "query": "?shot=boardwalk&time=18:25&seed=20261123",
+    "label": "Boardwalk at dusk",
+    "description": "On foot on the beachfront road at dusk: the hero Brisa GT parked beside Marlow, the boardwalk Ferris wheel and the neon strip behind, palms and beach umbrellas along the sand.",
+    "width": 1280,
+    "height": 800,
+    "bytes": 124608
+  },
+  {
+    "name": "2-play.jpg",
+    "query": "?shot=play&time=18:18&seed=20261123",
+    "label": "The Strip, behind the wheel",
+    "description": "Behind the wheel of the Brisa GT on Neon Avenue at dusk: palm-lined sidewalks, the PAWN shop and the diner awning, traffic and lit windows down the strip.",
+    "width": 1280,
+    "height": 800,
+    "bytes": 166025
+  },
+  {
+    "name": "3-chase.jpg",
+    "query": "?shot=chase&time=21:35&seed=20261123",
+    "label": "Three stars, night pursuit",
+    "description": "A three-star night pursuit on the Strip: three wanted stars lit, cruisers and the air unit on dispatch, a marked cruiser boxing the Brisa GT in on the right.",
+    "width": 1280,
+    "height": 800,
+    "bytes": 166047
+  },
+  {
+    "name": "4-docks.jpg",
+    "query": "?shot=docks&time=17:12&seed=20261123",
+    "label": "The cargo port",
+    "description": "The container port in the afternoon: Marlow on the quay, a gantry crane straddling the stacked containers behind, the port yard under a pale sky.",
+    "width": 1280,
+    "height": 800,
+    "bytes": 110936
+  }
 ]
