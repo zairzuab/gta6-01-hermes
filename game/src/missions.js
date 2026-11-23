@@ -1,10 +1,37 @@
-// Missions: five story jobs with staged objectives, rewards and a save.
-// The story: Marlow Reyes, a courier, works for Roxy at the Coral Diner and
-// her aunt Lourdes, while Port Azul PD closes in and a rival crew moves in.
-// Progress (money, completed jobs, rank, respect) persists to localStorage.
+// PORT AZUL: Neon Tide — the story jobs.
+//
+// Five jobs follow Marlow Reyes from Roxy's courier van on the boardwalk to a
+// manifest heist at the docks, with Lourdes's drops and Port Azul PD in
+// between. Progress (money, respect, rank, best heat, finished jobs) is kept
+// in localStorage under one key, and every finished job raises the runner's
+// rank toward KINGPIN.
+//
+// A job is a list of stages; a stage is completed by one of seven objective
+// kinds:
+//
+//   car      get behind the wheel
+//   marker   stand inside the yellow beacon (radius PICKUP_RADIUS)
+//   marker2  same, blue beacon
+//   marker3  same, green beacon
+//   ram      land RAM_HITS bumps on the rival courier
+//   clean    wanted level back to zero after the run had heat
+//   five     raise the wanted level to five stars
+//   survive  hold five stars for SURVIVE_SECONDS straight
+//
+// Only the marker kinds have a world position, so only those get a beacon and
+// a distance readout; a "clean" or "five" stage would send the player chasing
+// an empty pillar across the map.
 import { COAST_Z, streetCoord } from './city.js';
 
-const STORY = [
+const SAVE_KEY = 'portazul-neontide-save-v1';
+const PICKUP_RADIUS = 8;       // metres to count as reaching a beacon
+const RAM_HITS = 3;            // bumps that stop the rival courier
+const SURVIVE_SECONDS = 60;    // how long five stars must be held
+const MAX_RANK = 10;
+const RESPECT_PER_JOB = 300;
+
+// ---- the script -------------------------------------------------------------
+const JOBS = [
   {
     id: 'first',
     name: 'SALT & STEEL',
@@ -65,131 +92,146 @@ const STORY = [
   },
 ];
 
-// The "JOB n OF m" label is derived from the array, so adding a job cannot
-// leave a stale count on the missions that follow it.
-export const MISSIONS = STORY.map((m, i) => {
-  Object.defineProperty(m, 'count', {
-    get: () => `JOB ${i + 1} OF ${STORY.length}`,
+/** "JOB n OF m" — derived from the array, never hand-typed per mission. */
+export const MISSIONS = JOBS.map((job, i) => {
+  Object.defineProperty(job, 'count', {
     enumerable: true,
+    get() { return `JOB ${i + 1} OF ${JOBS.length}`; },
   });
-  return m;
+  return job;
 });
 
-const SAVE_KEY = 'portazul-neontide-save-v1';
+// ---- beacon look ------------------------------------------------------------
+const BEACONS = {
+  marker: { color: 0xffd75e, kind: 'pickup' },
+  marker2: { color: 0x4da3ff, kind: 'drop' },
+  marker3: { color: 0x7dffa8, kind: 'drop' },
+  ram: { color: 0xff4d5e, kind: 'ram' },
+};
+const DEFAULT_BEACON = BEACONS.marker2;
 
+/** How each objective kind is met. `bar` feeds the HUD's stage meter. */
+const HANDLERS = {
+  car(ctx) { return ctx.inCar; },
+  ram(ctx) { return ctx.ramHits >= RAM_HITS; },
+  five(ctx) { return ctx.wanted >= 5; },
+  clean(ctx) {
+    return ctx.wanted === 0 && (ctx.startedClean || ctx.cleanStartWanted === 0);
+  },
+  survive(ctx) { return false; },   // timed: handled by the runner itself
+};
+
+const BARS = {
+  car(ctx) { return ctx.inCar ? 1 : 0; },
+  ram(ctx) { return Math.min(1, ctx.ramHits / RAM_HITS); },
+  five(ctx) { return ctx.wanted / 5; },
+  clean(ctx) { return ctx.wanted === 0 ? 1 : 1 - ctx.wanted / 5; },
+};
+
+function barFor(stage) {
+  return BARS[stage.target] ?? ((ctx) => Math.max(0, 1 - ctx.markerDist / 240));
+}
+
+/** True when the objective is a place rather than a state. */
+function hasDestination(target) {
+  return BEACONS[target] !== undefined;
+}
+
+// ---- the saved run ---------------------------------------------------------
+function blankSave() {
+  return { money: 12400, respect: 0, rank: 1, bestWanted: 0, completed: [] };
+}
+
+function readSave(key) {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return blankSave();
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return blankSave();
+    const num = (v) => (Number.isFinite(v) ? v : null);
+    const known = new Set(MISSIONS.map((m) => m.id));
+    return {
+      money: num(parsed.money) ?? 12400,
+      respect: num(parsed.respect) ?? 0,
+      rank: num(parsed.rank) ?? 1,
+      bestWanted: num(parsed.bestWanted) ?? 0,
+      // Drop ids this build does not know: a stale job must not pin the run.
+      completed: Array.isArray(parsed.completed)
+        ? parsed.completed.filter((id) => known.has(id))
+        : [],
+    };
+  } catch {
+    // Storage blocked or the save is unreadable: start the story over.
+    return blankSave();
+  }
+}
+
+function writeSave(key, save) {
+  try { localStorage.setItem(key, JSON.stringify(save)); } catch { /* ignore */ }
+}
+
+function keepInside(i, n) {
+  return Math.max(0, Math.min(n - 1, i));
+}
+
+// ===========================================================================
+// The runner the game drives once per fixed step.
+// ===========================================================================
 export class MissionRunner {
   constructor() {
-    this.save = this.loadSave();
+    this.save = readSave(SAVE_KEY);
     this.missionIndex = 0;
     this.stageIndex = 0;
-    this.marker = null;         // {x, z, color, kind}
-    this.surviveTimer = 0;
-    this.surviveNeed = 60;
-    this.ramTarget = null;      // the rival courier car for the chase job
     this.done = false;
-    // The wanted level a "lose the heat" stage began at, or undefined until the
-    // first update of that stage. See update().
-    this.cleanStageStartWanted = undefined;
-    // Resume on the first job the save has not finished yet.
-    const firstOpen = MISSIONS.findIndex((m) => !this.save.completed.includes(m.id));
-    this.setMission(firstOpen === -1 ? MISSIONS.length - 1 : firstOpen);
+    this.marker = null;
+    this.surviveTimer = 0;
+    // Wanted level on the first update of the current "clean" stage, before
+    // its rule can decide anything.
+    this.cleanStartWanted = undefined;
+    const nextOpen = MISSIONS.findIndex((m) => !this.save.completed.includes(m.id));
+    this.setMission(nextOpen === -1 ? MISSIONS.length - 1 : nextOpen);
   }
 
-  loadSave() {
-    try {
-      const raw = localStorage.getItem(SAVE_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        if (parsed && typeof parsed === 'object') {
-          // Merge over the defaults: a save written by an older build (or a
-          // corrupted one) must not leave `bestWanted` undefined, which would
-          // turn the pause screen's best-heat line into "NaN".
-          const d = MissionRunner.defaultSave();
-          const num = (v) => (Number.isFinite(v) ? v : null);
-          return {
-            money: num(parsed.money) ?? d.money,
-            respect: num(parsed.respect) ?? d.respect,
-            rank: num(parsed.rank) ?? d.rank,
-            bestWanted: num(parsed.bestWanted) ?? d.bestWanted,
-            completed: Array.isArray(parsed.completed)
-              ? parsed.completed.filter((id) => MISSIONS.some((m) => m.id === id))
-              : [],
-          };
-        }
-      }
-    } catch { /* storage unavailable or corrupt: start fresh */ }
-    return MissionRunner.defaultSave();
-  }
+  static defaultSave() { return blankSave(); }
 
-  static defaultSave() {
-    return { money: 12400, completed: [], respect: 0, rank: 1, bestWanted: 0 };
-  }
-
-  persist() {
-    try { localStorage.setItem(SAVE_KEY, JSON.stringify(this.save)); } catch { /* ignore */ }
-  }
+  persist() { writeSave(SAVE_KEY, this.save); }
 
   mission() { return MISSIONS[this.missionIndex]; }
   stage() { return this.mission().stages[this.stageIndex]; }
 
+  /** Select a job and clear the stage-side timers that belong to the old one. */
   setMission(i) {
-    this.missionIndex = clampIndex(i, MISSIONS.length);
+    this.missionIndex = keepInside(i, MISSIONS.length);
     this.stageIndex = 0;
     this.done = false;
     this.surviveTimer = 0;
-    this.cleanStageStartWanted = undefined;
-    this.placeMarkerForStage();
+    this.cleanStartWanted = undefined;
+    this.marker = this.beaconFor(this.stage());
   }
 
-  placeMarkerForStage() {
-    const s = this.stage();
-    this.marker = null;
-    if (!s) return;
-    // Only stages with a place in the world get a beacon. "Get behind the
-    // wheel", "lose the heat", "raise five stars" and "survive" are states,
-    // not destinations, and a yellow marker downtown would send the player
-    // across the city for nothing.
-    if (s.target === 'car' || s.target === 'clean' || s.target === 'five' || s.target === 'survive') return;
-    const at = s.at || [streetCoord(3), streetCoord(3)];
-    const color = s.target === 'marker' ? 0xffd75e
-      : s.target === 'marker2' ? 0x4da3ff
-        : s.target === 'marker3' ? 0x7dffa8
-          : s.target === 'ram' ? 0xff4d5e : 0xffd75e;
-    const kind = s.target === 'ram' ? 'ram' : (s.target === 'marker' ? 'pickup' : 'drop');
-    this.marker = { x: at[0], z: at[1], color, kind };
+  /** The beacon the given stage wants, or null when it has no destination. */
+  beaconFor(stage) {
+    if (!stage || !hasDestination(stage.target)) return null;
+    const style = BEACONS[stage.target] || DEFAULT_BEACON;
+    const at = stage.at || [streetCoord(3), streetCoord(3)];
+    return { x: at[0], z: at[1], color: style.color, kind: style.kind };
   }
 
-  /** True once every job in the story is done. */
-  allDone() {
-    return this.save.completed.length >= MISSIONS.length;
-  }
-
-  /** Fraction of the whole story complete, 0..1. */
+  allDone() { return this.save.completed.length >= MISSIONS.length; }
   get progress() { return this.save.completed.length / MISSIONS.length; }
 
-  /**
-   * The reward for the job currently on the plate, or for the last job once the
-   * story is finished — the title screen's mission list reads this so a
-   * completed run shows what was earned rather than an undefined entry.
-   */
+  /** What job `i` pays — the last job once the story is finished. */
   rewardFor(i) {
-    const m = MISSIONS[clampIndex(i, MISSIONS.length)];
-    return m ? m.reward : 0;
+    const job = MISSIONS[keepInside(i, MISSIONS.length)];
+    return job ? job.reward : 0;
   }
 
-  /** Start the current job over from its first stage. */
-  restartMission() {
-    this.setMission(this.missionIndex);
-    this.surviveTimer = 0;
-    this.done = false;
-  }
+  restartMission() { this.setMission(this.missionIndex); }
 
-  /** Wipe the saved story (money, jobs, rank, respect) and start fresh. */
   resetSave() {
-    this.save = MissionRunner.defaultSave();
+    this.save = blankSave();
     this.persist();
     this.setMission(0);
-    this.done = false;
   }
 
   advance() {
@@ -198,78 +240,64 @@ export class MissionRunner {
       this.completeMission();
       return 'mission-complete';
     }
-    this.placeMarkerForStage();
-    this.cleanStageStartWanted = undefined;
+    this.cleanStartWanted = undefined;
+    this.marker = this.beaconFor(this.stage());
     return 'stage';
   }
 
   completeMission() {
-    const m = this.mission();
-    this.save.money += m.reward;
-    this.save.respect += 300;
-    if (!this.save.completed.includes(m.id)) this.save.completed.push(m.id);
-    this.save.rank = Math.min(10, 1 + this.save.completed.length);
+    const job = this.mission();
+    this.save.money += job.reward;
+    this.save.respect += RESPECT_PER_JOB;
+    if (!this.save.completed.includes(job.id)) this.save.completed.push(job.id);
+    this.save.rank = Math.min(MAX_RANK, 1 + this.save.completed.length);
     this.done = true;
     this.persist();
   }
 
   nextMission() {
-    if (this.missionIndex + 1 < MISSIONS.length) {
-      this.setMission(this.missionIndex + 1);
-      return true;
-    }
-    return false;
+    if (this.missionIndex + 1 >= MISSIONS.length) return false;
+    this.setMission(this.missionIndex + 1);
+    return true;
   }
 
   /**
-   * Called every frame. ctx: {inCar, wanted, markerDist, speed, startedClean,
-   * ramHits}. Returns 'stage' or 'mission-complete' on a transition.
+   * Feed it the live context once per frame:
+   * {inCar, wanted, markerDist, speed, startedClean, ramHits}.
+   * Returns 'stage', 'mission-complete', or null when nothing happened.
    */
   update(dt, ctx) {
-    const s = this.stage();
-    if (!s || this.done) return null;
-    if (s.target === 'car' && ctx.inCar) return this.advance();
-    if (s.target === 'marker' && ctx.markerDist < 8) return this.advance();
-    if (s.target === 'marker2' && ctx.markerDist < 8) return this.advance();
-    if (s.target === 'marker3' && ctx.markerDist < 8) return this.advance();
-    if (s.target === 'ram' && ctx.ramHits >= 3) return this.advance();
-    // A "clean" stage only completes if the player was actually wanted while it
-    // ran (startedClean), so a quiet drive does not skip it. A player who
-    // arrives already at zero stars has no heat to lose, though: without the
-    // cleanStageStartWanted arm below they would sit on "Lose the heat"
-    // forever with nothing left to do.
-    if (s.target === 'clean') {
-      if (this.cleanStageStartWanted === undefined) this.cleanStageStartWanted = ctx.wanted;
-      if (ctx.wanted === 0 && (ctx.startedClean || this.cleanStageStartWanted === 0)) return this.advance();
+    const stage = this.stage();
+    if (!stage || this.done) return null;
+
+    if (stage.target === 'survive') {
+      if (ctx.wanted < 5) {
+        // Letting the heat drop starts the clock over: surviving means
+        // holding five stars, not having touched them once.
+        this.surviveTimer = 0;
+      } else {
+        this.surviveTimer += dt;
+        if (this.surviveTimer >= SURVIVE_SECONDS) return this.advance();
+      }
       return null;
     }
-    if (s.target === 'five' && ctx.wanted >= 5) return this.advance();
-    if (s.target === 'survive') {
-      if (ctx.wanted >= 5) {
-        this.surviveTimer += dt;
-        if (this.surviveTimer >= this.surviveNeed) return this.advance();
-      } else {
-        // Dropping below five stars resets the clock — surviving means holding
-        // the heat, not having once reached it.
-        this.surviveTimer = 0;
-      }
+
+    if (stage.target === 'clean' && this.cleanStartWanted === undefined) {
+      this.cleanStartWanted = ctx.wanted;
     }
-    return null;
+
+    const handler = HANDLERS[stage.target]
+      ?? ((c) => c.markerDist < PICKUP_RADIUS);
+    return handler(ctx) ? this.advance() : null;
   }
 
+  /** 0..1 completion of the current stage, for the mission bar. */
   stageProgress(ctx) {
-    const s = this.stage();
-    if (!s) return 1;
-    if (s.target === 'car') return ctx.inCar ? 1 : 0;
-    if (s.target === 'survive') return Math.min(1, this.surviveTimer / this.surviveNeed);
-    if (s.target === 'clean') return ctx.wanted === 0 ? 1 : 1 - ctx.wanted / 5;
-    if (s.target === 'five') return ctx.wanted / 5;
-    if (s.target === 'ram') return Math.min(1, ctx.ramHits / 3);
-    if (s.target === 'marker' || s.target === 'marker2' || s.target === 'marker3') {
-      return Math.max(0, 1 - ctx.markerDist / 240);
+    const stage = this.stage();
+    if (!stage) return 1;
+    if (stage.target === 'survive') {
+      return Math.min(1, this.surviveTimer / SURVIVE_SECONDS);
     }
-    return this.stageIndex / this.mission().stages.length;
+    return barFor(stage)(ctx);
   }
 }
-
-function clampIndex(i, n) { return Math.max(0, Math.min(n - 1, i)); }

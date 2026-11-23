@@ -1,15 +1,40 @@
-// Traffic: cars cruising the street grid and pedestrians on the sidewalks.
-// Both are deliberately cheap — lane-following with a heading and a speed —
-// but they brake for the player and each other, honk when boxed in, turn at
-// intersections, panic when there is chaos, and can be car-jacked or run
-// down, so the city feels alive without a full agent simulation.
+// Ambient life: cars cruising the street grid and pedestrians on the sidewalks.
+//
+// Neither is an agent in the planning sense. A car is a lane (an axis plus a
+// direction) with a speed; a pedestrian is a heading with a walk cycle. The
+// reaction layer around that cheap core is what makes them read as alive:
+//
+//   * cars brake for the player, for each other and for anyone in the road,
+//     light their brake lamps while held back and honk when they stay boxed in;
+//   * cars swing onto the cross street at intersections instead of snapping;
+//   * a burst of chaos (a shot, a steal, a ram) sets a panic field that sends
+//     nearby people sprinting directly away and makes traffic hurry off;
+//   * a person can be punched, shot or run down, falls, and stays as scenery
+//     until the crowd has refilled enough to retire the oldest bodies.
+//
+// The module also owns the chase job's rival courier, a scripted runner that
+// keeps its distance and is rammed three times to end the job.
 import * as THREE from 'three';
 import { makeCar, makePerson } from './vehicles.js';
-import { CITY_HALF, PITCH, STREET_W, streetCoord, nearestStreet } from './city.js';
+import { CITY_HALF, PITCH, STREET_W, nearestStreet } from './city.js';
 import { disposeGroup } from './util.js';
 
 const SHIRTS = [0xd84a4a, 0x4a7ad8, 0x4ad87a, 0xd8c84a, 0xd84ad8, 0xf2f2f2, 0x333333, 0xff8c42];
 const PANTS = [0x2a3a55, 0x3a3a3a, 0x55402a, 0x22303f];
+
+// Sidewalk offset from a street centreline, just outside the kerb.
+const WALK_OFFSET = 9.4;
+// Population targets and the number of bodies kept before the oldest go.
+const CAR_COUNT = 14;
+const PED_COUNT = 26;
+const AVENUE_PED_COUNT = 14;
+const PED_TARGET = 40;
+const PED_BODY_CAP = 18;
+
+const rnd = () => Math.random();
+const rand = (lo, hi) => lo + rnd() * (hi - lo);
+const pick = (arr) => arr[Math.floor(rnd() * arr.length)];
+const side = () => (rnd() < 0.5 ? -1 : 1);
 
 export class Traffic {
   constructor(scene, city) {
@@ -17,36 +42,169 @@ export class Traffic {
     this.city = city;
     this.cars = [];
     this.peds = [];
-    this.events = [];          // {type:'honk', x, z} for the sound bank
-    this.spawnCars(14);
-    this.spawnPeds(26);
-    this.spawnAvenuePeds(14);
-    this.spawnParked();
+    this.events = [];           // honks raised this frame: {type:'honk', x, z}
     this.rival = null;
-    this.pedTarget = 40;       // the sidewalks refill so a long session stays alive
+    this.spawnCars(CAR_COUNT);
+    this.spawnPeds(PED_COUNT);
+    this.spawnAvenuePeds(AVENUE_PED_COUNT);
+    this.spawnParked();
+    this.pedTarget = PED_TARGET; // the sidewalks refill so a long session stays alive
   }
 
-  /** Top the pedestrian population back up, away from the player. */
+  // =========================================================================
+  // Queries
+  // =========================================================================
+
+  /** How many pedestrians are still on their feet. */
+  alivePeds() {
+    let n = 0;
+    for (const p of this.peds) if (!p.dead) n++;
+    return n;
+  }
+
+  /**
+   * The nearest living pedestrian to a point (for melee and gunfire).
+   * Returns null when nothing is within maxDist.
+   */
+  nearestPed(x, z, maxDist = Infinity) {
+    let best = null, bestD = maxDist;
+    for (const p of this.peds) {
+      if (p.dead) continue;
+      const d = Math.hypot(p.x - x, p.z - z);
+      if (d < bestD) { bestD = d; best = p; }
+    }
+    return best;
+  }
+
+  /** The nearest rideable car; a burnt-out wreck is scenery, not a ride. */
+  nearestCar(x, z, maxDist = 6) {
+    let best = null, bestD = maxDist;
+    for (const c of this.cars) {
+      if (c.dead) continue;
+      const d = Math.hypot(c.x - x, c.z - z);
+      if (d < bestD) { bestD = d; best = c; }
+    }
+    return best;
+  }
+
+  // =========================================================================
+  // Placement helpers
+  // =========================================================================
+
+  /** A random point on a street, with the axis it runs along and a heading. */
+  randomStreetPoint() {
+    const i = 1 + Math.floor(rnd() * 6);
+    const j = 1 + Math.floor(rnd() * 6);
+    const along = (rnd() - 0.5) * (PITCH - STREET_W);
+    if (rnd() < 0.5) {
+      return { x: -CITY_HALF + i * PITCH, z: -CITY_HALF + j * PITCH + along, axis: 'z', dir: side() };
+    }
+    return { x: -CITY_HALF + i * PITCH + along, z: -CITY_HALF + j * PITCH, axis: 'x', dir: side() };
+  }
+
+  /** Heading on the mesh that faces travel along (axis, dir). */
+  static headingFor(axis, dir) {
+    return axis === 'z' ? (dir > 0 ? Math.PI : 0) : (dir > 0 ? -Math.PI / 2 : Math.PI / 2);
+  }
+
+  /** A point beside a street centreline, on one sidewalk or the other. */
+  _sidewalkPoint(p) {
+    const s = side();
+    return p.axis === 'z'
+      ? { x: p.x + s * WALK_OFFSET, z: p.z }
+      : { x: p.x, z: p.z + s * WALK_OFFSET };
+  }
+
+  // =========================================================================
+  // Spawning
+  // =========================================================================
+
+  spawnCars(n) {
+    for (let i = 0; i < n; i++) {
+      const p = this.randomStreetPoint();
+      const kind = rnd() < 0.14 ? 'taxi' : 'traffic';
+      const mesh = makeCar(kind, i);
+      mesh.position.set(p.x, 0, p.z);
+      mesh.rotation.y = Traffic.headingFor(p.axis, p.dir);
+      this.scene.add(mesh);
+      this.cars.push({
+        mesh, x: p.x, z: p.z, axis: p.axis, dir: p.dir,
+        speed: rand(7, 12), targetSpeed: rand(8, 14),
+        heading: mesh.rotation.y, scared: 0, dead: false, hp: 60,
+        honkTimer: rand(0, 4), braking: false, parked: false,
+      });
+    }
+  }
+
+  spawnPeds(n) {
+    for (let i = 0; i < n; i++) {
+      const s = this._sidewalkPoint(this.randomStreetPoint());
+      this._addPed(s.x, s.z, rand(0, Math.PI * 2),
+        SHIRTS[i % SHIRTS.length], PANTS[(i + 1) % PANTS.length]);
+    }
+  }
+
+  /** Pedestrians strolling the main avenue's sidewalks, for busy chase shots. */
+  spawnAvenuePeds(n) {
+    for (let i = 0; i < n; i++) {
+      const s = side();
+      this._addPed(
+        30 + s * (STREET_W / 2 + 2.4 + rand(0, 2.6)),
+        -CITY_HALF + 20 + rnd() * (2 * CITY_HALF - 40),
+        rnd() < 0.5 ? 0 : Math.PI,
+        SHIRTS[i % SHIRTS.length], PANTS[i % PANTS.length]);
+    }
+  }
+
+  /** Parked cars along the kerb, ready to be stolen. */
+  spawnParked() {
+    for (const spot of this.city.parkedSpots) {
+      const mesh = makeCar('traffic', Math.floor(rnd() * 8));
+      mesh.position.set(spot.x, 0, spot.z);
+      mesh.rotation.y = spot.heading;
+      this.scene.add(mesh);
+      this.cars.push({
+        mesh, x: spot.x, z: spot.z, axis: 'z',
+        dir: spot.heading === Math.PI ? 1 : -1,
+        speed: 0, targetSpeed: rand(8, 13), heading: spot.heading,
+        scared: 0, dead: false, parked: true, hp: 60, honkTimer: 0, braking: false,
+      });
+    }
+  }
+
+  /** Build one walker, add it to the scene and return its record. */
+  _addPed(x, z, heading, shirt, pants) {
+    const mesh = makePerson(shirt ?? pick(SHIRTS), pants ?? pick(PANTS));
+    mesh.position.set(x, 0, z);
+    mesh.rotation.y = heading;
+    this.scene.add(mesh);
+    const ped = {
+      mesh, x, z, heading,
+      speed: rand(1.1, 1.9),
+      walkPhase: rand(0, 6), panic: 0, dead: false, hp: 30,
+    };
+    this.peds.push(ped);
+    return ped;
+  }
+
+  // =========================================================================
+  // The crowd: refill and body retirement
+  // =========================================================================
+
+  /**
+   * Refill the crowd away from the player. Bodies are scenery, but this list
+   * is walked every frame by gunfire, melee and the traffic update, so it is
+   * capped: once the sidewalks have refilled, the oldest bodies are retired.
+   */
   respawnPeds(playerPos) {
-    let alive = 0;
-    let dead = 0;
+    let alive = 0, dead = 0;
     for (const p of this.peds) { if (p.dead) dead++; else alive++; }
-    // Bodies on the street are scenery, but this list is walked every frame by
-    // gunfire, melee and the traffic update, so it is capped: once the
-    // sidewalks have refilled, the oldest bodies are cleared.
-    if (dead > 18) this._clearDeadPeds(dead - 18);
+    if (dead > PED_BODY_CAP) this._clearDeadPeds(dead - PED_BODY_CAP);
     if (alive >= this.pedTarget) return;
     for (let i = 0; i < 2; i++) {
       const p = this.city.randomStreetPoint(playerPos.x, playerPos.z, 70);
-      const sx = p.axis === 'z' ? p.x + (Math.random() < 0.5 ? -9.4 : 9.4) : p.x;
-      const sz = p.axis === 'x' ? p.z + (Math.random() < 0.5 ? -9.4 : 9.4) : p.z;
-      const mesh = makePerson(SHIRTS[Math.floor(Math.random() * SHIRTS.length)],
-        PANTS[Math.floor(Math.random() * PANTS.length)]);
-      mesh.position.set(sx, 0, sz);
-      const heading = Math.random() * Math.PI * 2;
-      mesh.rotation.y = heading;
-      this.scene.add(mesh);
-      this.peds.push(this._ped(mesh, sx, sz, heading));
+      const s = this._sidewalkPoint(p);
+      this._addPed(s.x, s.z, rand(0, Math.PI * 2));
     }
   }
 
@@ -63,102 +221,10 @@ export class Traffic {
     }
   }
 
-  /** How many pedestrians are still on their feet. */
-  alivePeds() {
-    let n = 0;
-    for (const p of this.peds) if (!p.dead) n++;
-    return n;
-  }
+  // =========================================================================
+  // The chase job's rival courier
+  // =========================================================================
 
-  /** The nearest living pedestrian to a point (for melee and gunfire). */
-  nearestPed(x, z, maxDist = Infinity) {
-    let best = null, bestD = maxDist;
-    for (const p of this.peds) {
-      if (p.dead) continue;
-      const d = Math.hypot(p.x - x, p.z - z);
-      if (d < bestD) { bestD = d; best = p; }
-    }
-    return best;
-  }
-
-  /** Pedestrians strolling the main avenue's sidewalks, for busy chase shots. */
-  spawnAvenuePeds(n) {
-    for (let i = 0; i < n; i++) {
-      const side = Math.random() < 0.5 ? -1 : 1;
-      const x = 30 + side * (STREET_W / 2 + 2.4 + Math.random() * 2.6);
-      const z = -CITY_HALF + 20 + Math.random() * (2 * CITY_HALF - 40);
-      const mesh = makePerson(SHIRTS[i % SHIRTS.length], PANTS[i % PANTS.length]);
-      mesh.position.set(x, 0, z);
-      const heading = Math.random() < 0.5 ? 0 : Math.PI;
-      mesh.rotation.y = heading;
-      this.scene.add(mesh);
-      this.peds.push(this._ped(mesh, x, z, heading));
-    }
-  }
-
-  _ped(mesh, x, z, heading) {
-    return {
-      mesh, x, z, heading, speed: 1.1 + Math.random() * 0.8,
-      walkPhase: Math.random() * 6, panic: 0, dead: false, hp: 30,
-    };
-  }
-
-  randomStreetPoint() {
-    const i = 1 + Math.floor(Math.random() * 6);
-    const j = 1 + Math.floor(Math.random() * 6);
-    const along = (Math.random() - 0.5) * (PITCH - STREET_W);
-    if (Math.random() < 0.5) {
-      return { x: -CITY_HALF + i * PITCH, z: -CITY_HALF + j * PITCH + along, axis: 'z', dir: Math.random() < 0.5 ? 1 : -1 };
-    }
-    return { x: -CITY_HALF + i * PITCH + along, z: -CITY_HALF + j * PITCH, axis: 'x', dir: Math.random() < 0.5 ? 1 : -1 };
-  }
-
-  spawnCars(n) {
-    for (let i = 0; i < n; i++) {
-      const p = this.randomStreetPoint();
-      const kind = Math.random() < 0.14 ? 'taxi' : 'traffic';
-      const mesh = makeCar(kind, i);
-      mesh.position.set(p.x, 0, p.z);
-      mesh.rotation.y = p.axis === 'z' ? (p.dir > 0 ? Math.PI : 0) : (p.dir > 0 ? -Math.PI / 2 : Math.PI / 2);
-      this.scene.add(mesh);
-      this.cars.push({
-        mesh, x: p.x, z: p.z, axis: p.axis, dir: p.dir,
-        speed: 7 + Math.random() * 5, targetSpeed: 8 + Math.random() * 6,
-        heading: mesh.rotation.y, scared: 0, dead: false, hp: 60, honkTimer: Math.random() * 4,
-      });
-    }
-  }
-
-  spawnPeds(n) {
-    for (let i = 0; i < n; i++) {
-      const p = this.randomStreetPoint();
-      const mesh = makePerson(SHIRTS[i % SHIRTS.length], PANTS[(i + 1) % PANTS.length]);
-      const sx = p.axis === 'z' ? p.x + (Math.random() < 0.5 ? -9.4 : 9.4) : p.x;
-      const sz = p.axis === 'x' ? p.z + (Math.random() < 0.5 ? -9.4 : 9.4) : p.z;
-      mesh.position.set(sx, 0, sz);
-      const heading = Math.random() * Math.PI * 2;
-      mesh.rotation.y = heading;
-      this.scene.add(mesh);
-      this.peds.push(this._ped(mesh, sx, sz, heading));
-    }
-  }
-
-  /** Parked cars along the kerb, ready to be stolen. */
-  spawnParked() {
-    for (const spot of this.city.parkedSpots) {
-      const mesh = makeCar('traffic', Math.floor(Math.random() * 8));
-      mesh.position.set(spot.x, 0, spot.z);
-      mesh.rotation.y = spot.heading;
-      this.scene.add(mesh);
-      this.cars.push({
-        mesh, x: spot.x, z: spot.z, axis: 'z', dir: spot.heading === Math.PI ? 1 : -1,
-        speed: 0, targetSpeed: 8 + Math.random() * 5, heading: spot.heading,
-        scared: 0, dead: false, parked: true, hp: 60, honkTimer: 0,
-      });
-    }
-  }
-
-  /** The chase job's rival courier: a fast car that flees the player. */
   spawnRival(x, z) {
     const mesh = makeCar('player', 0);
     mesh.userData.name = 'RIVAL COURIER';
@@ -179,17 +245,9 @@ export class Traffic {
     this.rival = null;
   }
 
-  nearestCar(x, z, maxDist = 6) {
-    let best = null; let bestD = maxDist;
-    for (const c of this.cars) {
-      // A burnt-out wreck is scenery, not a ride: entering it would strand the
-      // player in a car whose engine is already dead.
-      if (c.dead) continue;
-      const d = Math.hypot(c.x - x, c.z - z);
-      if (d < bestD) { bestD = d; best = c; }
-    }
-    return best;
-  }
+  // =========================================================================
+  // Queries and mutations the game uses
+  // =========================================================================
 
   /** Hand a traffic car to the player; it leaves the traffic list. */
   steal(car) {
@@ -202,34 +260,10 @@ export class Traffic {
   /** Chaos nearby: pedestrians run and cars speed up or swerve. */
   panicNear(x, z, radius = 26) {
     for (const p of this.peds) {
-      if (!p.dead && Math.hypot(p.x - x, p.z - z) < radius) p.panic = 3 + Math.random() * 2;
+      if (!p.dead && Math.hypot(p.x - x, p.z - z) < radius) p.panic = rand(3, 5);
     }
     for (const c of this.cars) {
       if (Math.hypot(c.x - x, c.z - z) < radius) c.scared = 2.5;
-    }
-  }
-
-  /**
-   * Turn a traffic car at an intersection. A turning car swings onto the cross
-   * street rather than snapping, so the grid reads as a road network rather
-   * than a conveyor belt.
-   */
-  turnCar(c, dt) {
-    const crossAxis = c.axis === 'z' ? 'x' : 'z';
-    // Pick the direction of travel on the cross street the first time only.
-    if (c.turnDir === undefined) c.turnDir = Math.random() < 0.5 ? 1 : -1;
-    const step = 9 * dt;
-    const lateral = c.axis === 'z' ? c.x : c.z;
-    const target = nearestStreet(lateral) ?? lateral;
-    const d = target - lateral;
-    if (Math.abs(d) > 1.0) {
-      // Swing onto the cross street's centreline while still driving forward.
-      if (c.axis === 'z') c.x += Math.sign(d) * Math.min(Math.abs(d), step);
-      else c.z += Math.sign(d) * Math.min(Math.abs(d), step);
-    } else {
-      c.axis = crossAxis;
-      c.dir = c.turnDir;
-      c.turnDir = undefined;
     }
   }
 
@@ -265,19 +299,32 @@ export class Traffic {
     return false;
   }
 
+  // =========================================================================
+  // Per-frame simulation
+  // =========================================================================
+
   update(dt, playerPos, policeNear, playerInCar) {
     this.events.length = 0;
     const limit = this.city.worldLimit();
-    // A fast car nearby scares pedestrians even before it hits anything.
     const playerSpeed = Math.abs(playerPos.speed || 0);
 
-    // --- traffic cars ------------------------------------------------------
+    this.updateCars(dt, playerPos, playerSpeed, policeNear, limit);
+    this.updatePeds(dt, playerPos, playerSpeed, playerInCar);
+    this.respawnPeds(playerPos);
+    this.updateRival(dt, playerPos);
+  }
+
+  // ---- traffic cars --------------------------------------------------------
+
+  updateCars(dt, playerPos, playerSpeed, policeNear, limit) {
     for (const c of this.cars) {
       if (c.dead) continue;
-      // Brake lights: a car held back by traffic, the player or a panic stop
-      // shows lit brakes — the cheapest way to read a queue at night.
+
+      // Brake lamps: a car held back shows lit brakes — the cheapest way to
+      // read a queue at night.
       const brakeMat = c.mesh.userData.brakeMat;
       if (brakeMat) brakeMat.emissiveIntensity = c.braking ? 2.6 : 1.6;
+
       let want = c.parked ? 0 : c.targetSpeed;
       const ahead = 10;
       const ax = c.axis === 'z' ? c.x : c.x + c.dir * ahead;
@@ -302,13 +349,13 @@ export class Traffic {
       if (blocked) want = 0;
       c.speed += (want - c.speed) * Math.min(1, dt * (blocked ? 5 : 1.6));
       c.braking = blocked;
-      // A car that is scared but unimpeded is reversing out of trouble, not
-      // standing on its brakes: only a real obstruction lights the brakes.
+      // A scared but unimpeded car is reversing out of trouble, not standing
+      // on its brakes: only a real obstruction lights the brakes.
       if (c.scared > 0 && !blocked) c.braking = false;
 
       c.honkTimer -= dt;
       if (blocked && !c.parked && c.honkTimer <= 0) {
-        c.honkTimer = 2 + Math.random() * 4;
+        c.honkTimer = rand(2, 6);
         this.events.push({ type: 'honk', x: c.x, z: c.z });
       }
 
@@ -322,16 +369,42 @@ export class Traffic {
         if (c.x < -CITY_HALF - 12) c.x = CITY_HALF + 12;
       }
       // Turn at an intersection now and then, so the grid is not a conveyor.
-      // turnCar is called every frame while a turn is in progress (turnDir set).
-      if (!c.parked && c.speed > 2 && (c.turnDir !== undefined || Math.random() < dt * 0.09)) this.turnCar(c, dt);
+      // turnCar runs every frame while a turn is in progress (turnDir set).
+      if (!c.parked && c.speed > 2 && (c.turnDir !== undefined || rnd() < dt * 0.09)) {
+        this.turnCar(c, dt);
+      }
       c.x = Math.max(limit.minX, Math.min(limit.maxX, c.x));
       c.z = Math.max(limit.minZ, Math.min(limit.maxZ, c.z));
       c.mesh.position.set(c.x, 0, c.z);
-      c.mesh.rotation.y = c.axis === 'z' ? (c.dir > 0 ? Math.PI : 0) : (c.dir > 0 ? -Math.PI / 2 : Math.PI / 2);
+      c.mesh.rotation.y = Traffic.headingFor(c.axis, c.dir);
       for (const w of c.mesh.userData.wheels) w.rotation.x += c.speed * dt * 2.2;
     }
+  }
 
-    // --- pedestrians -------------------------------------------------------
+  /**
+   * Swing a traffic car onto the cross street rather than snapping, so the
+   * grid reads as a road network. Called every frame while a turn runs.
+   */
+  turnCar(c, dt) {
+    const crossAxis = c.axis === 'z' ? 'x' : 'z';
+    if (c.turnDir === undefined) c.turnDir = side();
+    const step = 9 * dt;
+    const lateral = c.axis === 'z' ? c.x : c.z;
+    const target = nearestStreet(lateral) ?? lateral;
+    const d = target - lateral;
+    if (Math.abs(d) > 1.0) {
+      if (c.axis === 'z') c.x += Math.sign(d) * Math.min(Math.abs(d), step);
+      else c.z += Math.sign(d) * Math.min(Math.abs(d), step);
+    } else {
+      c.axis = crossAxis;
+      c.dir = c.turnDir;
+      c.turnDir = undefined;
+    }
+  }
+
+  // ---- pedestrians ---------------------------------------------------------
+
+  updatePeds(dt, playerPos, playerSpeed, playerInCar) {
     for (const p of this.peds) {
       if (p.dead) continue;
       const dp = Math.hypot(p.x - playerPos.x, p.z - playerPos.z);
@@ -348,9 +421,9 @@ export class Traffic {
       p.z += Math.cos(p.heading) * speed * dt;
       if (Math.abs(p.x) > CITY_HALF + 8 || Math.abs(p.z) > CITY_HALF + 8
           || this.city.hitsBuilding(p.x, p.z, 1) || this.city.isWater(p.x, p.z)) {
-        p.heading += Math.PI / 2 + (Math.random() - 0.5);
+        p.heading += Math.PI / 2 + (rnd() - 0.5);
       }
-      if (p.panic <= 0 && Math.random() < dt * 0.09) p.heading += (Math.random() - 0.5) * 1.2;
+      if (p.panic <= 0 && rnd() < dt * 0.09) p.heading += (rnd() - 0.5) * 1.2;
       p.walkPhase += speed * dt * 4;
       p.mesh.position.set(p.x, 0, p.z);
       p.mesh.rotation.y = p.heading;
@@ -360,9 +433,6 @@ export class Traffic {
       p.mesh.userData.arms[0].rotation.x = -swing * 0.7;
       p.mesh.userData.arms[1].rotation.x = swing * 0.7;
     }
-
-    this.respawnPeds(playerPos);
-    this.updateRival(dt, playerPos);
   }
 
   /** The rival courier runs the grid away from the player. */
@@ -374,14 +444,14 @@ export class Traffic {
     const dist = Math.hypot(dx, dz);
     // Pick the axis that increases the distance from the player.
     if (r.turnTimer <= 0) {
-      r.turnTimer = 0.8 + Math.random() * 0.8;
+      r.turnTimer = rand(0.8, 1.6);
       const opts = [];
       if (Math.abs(dx) > Math.abs(dz)) opts.push({ axis: 'x', dir: dx > 0 ? 1 : -1 });
       else opts.push({ axis: 'z', dir: dz > 0 ? 1 : -1 });
-      opts.push({ axis: 'x', dir: Math.random() < 0.5 ? 1 : -1 });
-      opts.push({ axis: 'z', dir: Math.random() < 0.5 ? 1 : -1 });
-      const pick = opts[Math.floor(Math.random() * opts.length)];
-      r.axis = pick.axis; r.dir = pick.dir;
+      opts.push({ axis: 'x', dir: side() });
+      opts.push({ axis: 'z', dir: side() });
+      const pickDir = opts[Math.floor(rnd() * opts.length)];
+      r.axis = pickDir.axis; r.dir = pickDir.dir;
     }
     const want = r.stopped ? 0 : (dist < 26 ? r.targetSpeed * 1.15 : r.targetSpeed * 0.8);
     r.speed += (want - r.speed) * Math.min(1, dt * 1.4);
@@ -394,7 +464,7 @@ export class Traffic {
       if (r.z > CITY_HALF + 10) { r.z = CITY_HALF + 10; r.dir = -1; }
       if (r.z < -CITY_HALF - 10) { r.z = -CITY_HALF - 10; r.dir = 1; }
     }
-    r.heading = r.axis === 'z' ? (r.dir > 0 ? Math.PI : 0) : (r.dir > 0 ? -Math.PI / 2 : Math.PI / 2);
+    r.heading = Traffic.headingFor(r.axis, r.dir);
     r.mesh.position.set(r.x, 0, r.z);
     r.mesh.rotation.y = r.heading;
     for (const w of r.mesh.userData.wheels) w.rotation.x += r.speed * dt * 2.2;

@@ -1,9 +1,13 @@
 // Police: the wanted system and the Port Azul PD response.
+//
 // Wanted is 0-5 stars driven by a heat meter. Cruisers chase and PIT; at 2+
-// stars a roadblock with a spike strip is placed ahead; at 3+ a helicopter
-// orbits with a searchlight; at 5 an armoured truck rolls in. Heat decays
-// only when the player is out of sight and slow — losing the heat is the
-// way a mission is won.
+// stars a roadblock with a spike strip is placed ahead on the street the player
+// is actually on; at 3+ a helicopter orbits with a searchlight; at 5 an armoured
+// truck rolls in. Heat decays only when the player is out of sight and slow —
+// losing the heat is how a mission is won.
+//
+// The module exposes two callbacks the game installs (onShoot, onRam) so officer
+// gunfire and PIT rams reach the player without this file importing the game.
 import * as THREE from 'three';
 import { makeCar, makeHelicopter, makeTank } from './vehicles.js';
 import { CITY_HALF, PITCH, nearestStreet } from './city.js';
@@ -15,24 +19,35 @@ export class Police {
   constructor(scene, city) {
     this.scene = scene;
     this.city = city;
+
+    // The wanted state: stars are the public face, heat drives them.
     this.wanted = 0;
     this.heat = 0;              // 0..100, drives the star count
-    this.hiddenTimer = 0;
+    this.hiddenTimer = 0;       // seconds spent unseen and slow
+    this.lastKnown = { x: 0, z: 0 };
+
+    // Every unit currently on the map.
     this.cruisers = [];         // {mesh, x, z, heading, speed, state, callsign, hp, disabled}
     this.heli = null;
     this.tank = null;
     this.roadblock = null;
+
+    // Clocks for spawning, roadblocks, gunfire and the beacon flash.
     this.spawnTimer = 0;
     this.roadblockTimer = 8;
-    this.lightPhase = 0;
-    this.lastKnown = { x: 0, z: 0 };
     this.fireTimer = 4;
-    this.arrest = 0;           // 0..1, fills while an officer has you boxed in
-    this.shots = [];           // tracer lines fired by officers
-    this.onShoot = null;       // (damage) => void, set by the game
-    this.onRam = null;         // (damage) => void, set by the game
+    this.lightPhase = 0;
+
+    // The arrest meter and the tracer pool.
+    this.arrest = 0;            // 0..1, fills while an officer has you boxed in
+    this.shots = [];
+
+    // Installed by the game: (damage) => void.
+    this.onShoot = null;
+    this.onRam = null;
   }
 
+  // ---- wanted level --------------------------------------------------------
   stars() { return this.wanted; }
 
   /** Record a crime: heat, and the last place the player was seen. */
@@ -64,6 +79,29 @@ export class Police {
     this.hiddenTimer = 0;
   }
 
+  // ---- unit housekeeping ---------------------------------------------------
+  /** Remove one mesh from the scene and release its per-instance resources. */
+  _drop(mesh) {
+    this.scene.remove(mesh);
+    disposeGroup(mesh);
+  }
+
+  /**
+   * Clear every unit. With the heat gone they are gone too, so a cleared trail
+   * stays clear instead of quietly rebuilding. `resetArrest` clears the arrest
+   * meter as well, which only happens when there was actually something to
+   * clear; a restart uses reset() for that.
+   */
+  _clearUnits(resetArrest) {
+    for (const c of this.cruisers) this._drop(c.mesh);
+    this.cruisers = [];
+    this.removeHelicopter();
+    this.removeTank();
+    this.clearRoadblock();
+    if (resetArrest) this.arrest = 0;
+  }
+
+  // ---- spawning ------------------------------------------------------------
   /** A street point at least `minDist` from the player, for spawning units. */
   spawnPoint(playerX, playerZ, minDist = 70) {
     // Keep the spawn under the 190 m break-off radius: a unit placed past it
@@ -103,6 +141,7 @@ export class Police {
     mesh.scale.setScalar(1.3);
     mesh.position.set(px, 18, pz + 38);
     this.scene.add(mesh);
+    // The searchlight pool on the ground, following the aircraft.
     const pool = new THREE.Mesh(
       new THREE.CircleGeometry(7.5, 24),
       new THREE.MeshBasicMaterial({
@@ -146,6 +185,7 @@ export class Police {
     this.roadblock = null;
   }
 
+  // ---- roadblocks ----------------------------------------------------------
   /** Two cruisers across the street ahead of the player plus a spike strip. */
   placeRoadblock(px, pz, heading) {
     this.clearRoadblock();
@@ -170,6 +210,7 @@ export class Police {
       this.city.addHeadlights?.(car);
       meshes.push(car);
     }
+    // The strip itself: a dark base with a row of spikes.
     const strip = new THREE.Group();
     const base = new THREE.Mesh(new THREE.BoxGeometry(9.5, 0.12, 1.2),
       new THREE.MeshLambertMaterial({ color: 0x222222 }));
@@ -197,6 +238,7 @@ export class Police {
     return false;
   }
 
+  // ---- the pursuit ---------------------------------------------------------
   update(dt, player, onFoot) {
     const px = player.x, pz = player.z;
     const pSpeed = Math.abs(player.speed || 0);
@@ -222,15 +264,10 @@ export class Police {
     } else {
       this.hiddenTimer = 0;
     }
-    // Units only exist while they are wanted; with the heat gone they are gone
-    // too, so a cleared trail stays clear instead of quietly rebuilding.
-    if (this.wanted === 0 && (this.cruisers.length || this.heli || this.tank || this.roadblock)) {
-      for (const c of this.cruisers) { this.scene.remove(c.mesh); disposeGroup(c.mesh); }
-      this.cruisers = [];
-      this.removeHelicopter();
-      this.removeTank();
-      this.clearRoadblock();
-      this.arrest = 0;
+
+    // Units only exist while they are wanted; with the heat gone they go too.
+    if (this.wanted === 0) {
+      this._clearUnits(this.cruisers.length > 0 || !!this.heli || !!this.tank || !!this.roadblock);
     }
 
     // --- spawn / despawn by wanted level ----------------------------------
@@ -245,18 +282,11 @@ export class Police {
     for (let i = this.cruisers.length - 1; i >= 0; i--) {
       const c = this.cruisers[i];
       if (!c.disabled && Math.hypot(c.x - px, c.z - pz) > 190) {
-        this.scene.remove(c.mesh);
-        disposeGroup(c.mesh);
+        this._drop(c.mesh);
         this.cruisers.splice(i, 1);
       }
     }
-    if (this.wanted === 0) {
-      for (const c of this.cruisers) { this.scene.remove(c.mesh); disposeGroup(c.mesh); }
-      this.cruisers = [];
-      this.removeHelicopter();
-      this.removeTank();
-      this.clearRoadblock();
-    }
+    if (this.wanted === 0) this._clearUnits(false);
     if (this.wanted >= 3) this.spawnHelicopter(px, pz); else this.removeHelicopter();
     if (this.wanted >= 5) this.spawnTank(px, pz); else this.removeTank();
 
@@ -271,7 +301,16 @@ export class Police {
       this.roadblockTimer = 6;
     }
 
-    // --- cruiser AI: chase, PIT, box in -----------------------------------
+    this._updateCruisers(dt, player, px, pz, pSpeed);
+    this._updateHelicopter(dt, px, pz);
+    this._updateTank(dt, px, pz);
+    this._updateGunfire(dt, player, onFoot, px, pz);
+    this._updateArrest(dt, onFoot, px, pz, pSpeed, nearest);
+    this._updateShots(dt);
+  }
+
+  /** Cruiser AI: chase, PIT and box in, then pose the mesh. */
+  _updateCruisers(dt, player, px, pz, pSpeed) {
     for (const c of this.cruisers) {
       if (c.disabled) continue;
       // Far from the player they search the last known position and sweep
@@ -282,9 +321,7 @@ export class Police {
       const dx = tx - c.x, dz = tz - c.z;
       const dist = Math.hypot(px - c.x, pz - c.z);
       const targetHeading = Math.atan2(-dx, -dz);
-      let turn = targetHeading - c.heading;
-      while (turn > Math.PI) turn -= Math.PI * 2;
-      while (turn < -Math.PI) turn += Math.PI * 2;
+      let turn = wrapTurn(targetHeading - c.heading);
 
       if (dist < 9 && Math.abs(turn) < 0.5 && pSpeed > 8 && c.ramCooldown <= 0) {
         c.state = 'pit';
@@ -320,6 +357,8 @@ export class Police {
       c.mesh.position.set(c.x, 0, c.z);
       c.mesh.rotation.y = c.heading;
       for (const w of c.mesh.userData.wheels) w.rotation.x += c.speed * dt * 2.2;
+      // Alternate the light bar; the phase lives in lightPhase so every cruiser
+      // flashes in step.
       const lb = c.mesh.userData.lightBar;
       if (lb) {
         const on = Math.floor(this.lightPhase * 6) % 2 === 0;
@@ -328,67 +367,72 @@ export class Police {
       }
       c.dist = dist;
     }
+  }
 
-    // --- helicopter: a low close orbit with a searchlight ------------------
-    if (this.heli) {
-      const h = this.heli;
-      h.angle += dt * 0.34;
-      const r = 38;
-      h.mesh.position.set(
-        px + Math.cos(h.angle) * r,
-        h.height + Math.sin(h.angle * 0.7) * 3.2,
-        pz + Math.sin(h.angle) * r);
-      h.mesh.rotation.y = Math.atan2(px - h.mesh.position.x, pz - h.mesh.position.z);
-      h.mesh.userData.rotor.rotation.y += dt * 22;
-      h.mesh.userData.tailRotor.rotation.x += dt * 18;
-      const bc = h.mesh.userData.beacon;
-      if (bc) bc.material.emissiveIntensity = (Math.floor(this.lightPhase * 3) % 2 === 0) ? 3 : 0.25;
-      if (h.pool) h.pool.position.set(h.mesh.position.x, 0.06, h.mesh.position.z);
-    }
+  /** Helicopter: a low close orbit with a searchlight. */
+  _updateHelicopter(dt, px, pz) {
+    const h = this.heli;
+    if (!h) return;
+    h.angle += dt * 0.34;
+    const r = 38;
+    h.mesh.position.set(
+      px + Math.cos(h.angle) * r,
+      h.height + Math.sin(h.angle * 0.7) * 3.2,
+      pz + Math.sin(h.angle) * r);
+    h.mesh.rotation.y = Math.atan2(px - h.mesh.position.x, pz - h.mesh.position.z);
+    h.mesh.userData.rotor.rotation.y += dt * 22;
+    h.mesh.userData.tailRotor.rotation.x += dt * 18;
+    const bc = h.mesh.userData.beacon;
+    if (bc) bc.material.emissiveIntensity = (Math.floor(this.lightPhase * 3) % 2 === 0) ? 3 : 0.25;
+    if (h.pool) h.pool.position.set(h.mesh.position.x, 0.06, h.mesh.position.z);
+  }
 
-    // --- armoured truck: slow, heavy, rams --------------------------------
-    if (this.tank) {
-      const t = this.tank;
-      const dx = px - t.x, dz = pz - t.z;
-      const dist = Math.hypot(dx, dz);
-      const targetHeading = Math.atan2(-dx, -dz);
-      let turn = targetHeading - t.heading;
-      while (turn > Math.PI) turn -= Math.PI * 2;
-      while (turn < -Math.PI) turn += Math.PI * 2;
-      t.heading += clamp(turn, -0.7 * dt, 0.7 * dt);
-      t.speed += (Math.min(11, dist * 0.3) - t.speed) * Math.min(1, dt);
-      t.x -= Math.sin(t.heading) * t.speed * dt;
-      t.z -= Math.cos(t.heading) * t.speed * dt;
-      t.mesh.position.set(t.x, 0, t.z);
-      t.mesh.rotation.y = t.heading;
-      t.dist = dist;
-      t.mesh.userData.turret.rotation.y = clamp(Math.atan2(-dx, -dz) - t.heading, -0.9, 0.9);
-    }
+  /** Armoured truck: slow, heavy, rams. */
+  _updateTank(dt, px, pz) {
+    const t = this.tank;
+    if (!t) return;
+    const dx = px - t.x, dz = pz - t.z;
+    const dist = Math.hypot(dx, dz);
+    t.heading += clamp(wrapTurn(Math.atan2(-dx, -dz) - t.heading), -0.7 * dt, 0.7 * dt);
+    t.speed += (Math.min(11, dist * 0.3) - t.speed) * Math.min(1, dt);
+    t.x -= Math.sin(t.heading) * t.speed * dt;
+    t.z -= Math.cos(t.heading) * t.speed * dt;
+    t.mesh.position.set(t.x, 0, t.z);
+    t.mesh.rotation.y = t.heading;
+    t.dist = dist;
+    t.mesh.userData.turret.rotation.y = clamp(Math.atan2(-dx, -dz) - t.heading, -0.9, 0.9);
+  }
 
-    // --- officer gunfire at 3+ stars --------------------------------------
+  /** Officer gunfire at 3+ stars, from a cruiser or the air unit. */
+  _updateGunfire(dt, player, onFoot, px, pz) {
     this.fireTimer -= dt;
-    if (this.wanted >= 3 && this.fireTimer <= 0) {
-      this.fireTimer = 1.1 + Math.random() * 1.5;
-      const shooter = this.cruisers.find((c) => !c.disabled && Math.hypot(c.x - px, c.z - pz) < 48);
-      if (shooter) {
-        const hit = Math.random() < (onFoot ? 0.5 : 0.28);
-        this._tracer(shooter.x, shooter.z, px, pz, hit);
-        if (hit && this.onShoot) this.onShoot(3 + Math.random() * 5);
-      } else if (this.wanted >= 4 && this.heli
-        && Math.hypot(this.heli.mesh.position.x - px, this.heli.mesh.position.z - pz) < 95) {
-        // At four stars the air unit takes the shots no cruiser can reach.
-        const hit = Math.random() < (onFoot ? 0.22 : 0.13);
-        this._tracer(this.heli.mesh.position.x, this.heli.mesh.position.z, px, pz, hit);
-        if (hit && this.onShoot) this.onShoot(2 + Math.random() * 4);
-      }
+    if (this.wanted < 3 || this.fireTimer > 0) return;
+    this.fireTimer = 1.1 + Math.random() * 1.5;
+    const shooter = this.cruisers.find((c) => !c.disabled && Math.hypot(c.x - px, c.z - pz) < 48);
+    if (shooter) {
+      const hit = Math.random() < (onFoot ? 0.5 : 0.28);
+      this._tracer(shooter.x, shooter.z, px, pz, hit);
+      if (hit && this.onShoot) this.onShoot(3 + Math.random() * 5);
+    } else if (this.wanted >= 4 && this.heli
+      && Math.hypot(this.heli.mesh.position.x - px, this.heli.mesh.position.z - pz) < 95) {
+      // At four stars the air unit takes the shots no cruiser can reach.
+      const hit = Math.random() < (onFoot ? 0.22 : 0.13);
+      this._tracer(this.heli.mesh.position.x, this.heli.mesh.position.z, px, pz, hit);
+      if (hit && this.onShoot) this.onShoot(2 + Math.random() * 4);
     }
+  }
 
-    // --- arrest: an officer has you boxed in and you are not moving --------
-    const near = this.nearestPoliceDist(px, pz);
-    if (this.wanted > 0 && onFoot && pSpeed < 1.2 && near < 7) this.arrest = Math.min(1, this.arrest + dt / 3);
-    else this.arrest = Math.max(0, this.arrest - dt / 2);
+  /** Arrest: an officer has you boxed in and you are not moving. */
+  _updateArrest(dt, onFoot, px, pz, pSpeed, nearest) {
+    if (this.wanted > 0 && onFoot && pSpeed < 1.2 && nearest < 7) {
+      this.arrest = Math.min(1, this.arrest + dt / 3);
+    } else {
+      this.arrest = Math.max(0, this.arrest - dt / 2);
+    }
+  }
 
-    // --- officer tracers ---------------------------------------------------
+  /** Age out the tracer lines. */
+  _updateShots(dt) {
     for (let i = this.shots.length - 1; i >= 0; i--) {
       const s = this.shots[i];
       s.life -= dt;
@@ -437,11 +481,7 @@ export class Police {
 
   /** Wipe every unit: a restart or a new game. */
   reset() {
-    for (const c of this.cruisers) { this.scene.remove(c.mesh); disposeGroup(c.mesh); }
-    this.cruisers = [];
-    this.removeHelicopter();
-    this.removeTank();
-    this.clearRoadblock();
+    this._clearUnits(true);
     for (const s of this.shots) this.scene.remove(s.line);
     this.shots = [];
     this.heat = 0;
@@ -488,4 +528,11 @@ export class Police {
     });
     return list.slice(0, 5);
   }
+}
+
+/** Wrap a heading difference into [-PI, PI]. */
+function wrapTurn(d) {
+  while (d > Math.PI) d -= Math.PI * 2;
+  while (d < -Math.PI) d += Math.PI * 2;
+  return d;
 }

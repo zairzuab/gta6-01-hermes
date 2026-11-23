@@ -1,11 +1,20 @@
-// HUD: every DOM overlay update plus the circular minimap. The layout is the
-// classic crime-game spread — mission card top-left, wanted/vitals top-right,
-// dispatch list, minimap bottom-left, speedometer bottom-right, radio ticker
-// centre-bottom.
+// HUD: every DOM overlay plus the circular minimap.
+//
+// One class owns the whole screen furniture. It stays deliberately dumb: the
+// game pushes live values in through the setters below and this module decides
+// what actually reaches the DOM. Two rules shape those setters:
+//
+//   * Write only on change. When an argument matches the last one seen, the
+//     setter returns without touching innerHTML or a style, so a quiet street
+//     does not pay for a rebuild every frame.
+//   * Guard the optional elements. A few ids (#prompt, #toast, #arrestWrap,
+//     #dmgFlash) can be absent or hidden depending on context, so every touch
+//     of them is guarded and the HUD still works.
 import { WEAPONS } from './weapons.js';
-import { CITY_HALF, PITCH, GRID, COAST_Z, streetCoord } from './city.js';
+import { CITY_HALF, GRID, COAST_Z, streetCoord } from './city.js';
 import { formatClock } from './util.js';
 
+// Every element id this module writes to, resolved once at construction.
 const IDS = [
   'mCount', 'mName', 'mStage', 'mBarFill', 'mObj', 'mReward', 'stars', 'sightLine',
   'money', 'clock', 'healthBar', 'healthVal', 'staminaBar', 'staminaVal', 'armourBar',
@@ -15,23 +24,49 @@ const IDS = [
   'prompt', 'arrestWrap', 'arrestFill', 'toast', 'clockTag', 'speedo',
 ];
 
+// The minimap canvas is square and shows MAP_RANGE metres edge to edge, so the
+// world-to-pixel factor is a constant rather than something recomputed per blip.
+const MAP_SIZE = 202;
+const MAP_RANGE = 200;
+const MAP_SCALE = MAP_SIZE / MAP_RANGE;
+
+/** The star row is always five cells, lit or dim. */
+const STAR_COUNT = 5;
+
+/** The rank ladder printed beside the rank number. */
+function rankTitle(rank) {
+  if (rank >= 9) return 'KINGPIN';
+  if (rank >= 7) return 'CREW BOSS';
+  if (rank >= 5) return 'ENFORCER';
+  if (rank >= 3) return 'RUNNER';
+  return 'STREET';
+}
+
 export class Hud {
   constructor() {
     this.el = {};
     for (const id of IDS) this.el[id] = document.getElementById(id);
+
     this.minimap = document.getElementById('minimap');
     this.mm = this.minimap.getContext('2d');
-    this.buildSlots();
+
+    // Cached weapon-slot nodes and the three message countdowns.
+    this.slotEls = [];
     this.centerTimer = 0;
     this.tickerTimer = 0;
     this.toastTimer = 0;
     this.toastQueue = [];
+
+    // Objective line state: the base text plus the live distance suffix.
+    this._objText = '';
+    this._markerDist = null;
+
+    this.buildSlots();
   }
 
+  // ---- weapon slots --------------------------------------------------------
   buildSlots() {
     this.el.slots.innerHTML = '';
-    // Cached once: setSlots and setDryFire run every frame, and five
-    // getElementById calls per frame is five more than this needs.
     this.slotEls = [];
     WEAPONS.forEach((w, i) => {
       const d = document.createElement('div');
@@ -43,6 +78,7 @@ export class Hud {
     });
   }
 
+  // ---- mission card --------------------------------------------------------
   setMission(mission, stage, stageIndex, progress) {
     this.el.mCount.textContent = mission.count;
     this.el.mName.textContent = mission.name;
@@ -65,13 +101,12 @@ export class Hud {
     return `${this._objText || ''}  ·  ${Math.round(this._markerDist)} m`;
   }
 
+  // ---- wanted level --------------------------------------------------------
   setWanted(stars, inSight) {
-    // The star row is five spans; rebuild it only when the count changes
-    // instead of every frame.
     if (stars !== this._stars) {
       this._stars = stars;
       let html = '';
-      for (let i = 0; i < 5; i++) html += `<span class="${i < stars ? 'on' : 'off'}">★</span>`;
+      for (let i = 0; i < STAR_COUNT; i++) html += `<span class="${i < stars ? 'on' : 'off'}">★</span>`;
       this.el.stars.innerHTML = html;
       this.el.stars.style.transform = stars >= 4 ? 'scale(1.1)' : 'scale(1)';
     }
@@ -83,6 +118,7 @@ export class Hud {
     }
   }
 
+  // ---- vitals and loadout --------------------------------------------------
   setStats(money, health, armour, stamina, weapon, ammo, rank, respect) {
     this.el.money.textContent = '$' + money.toLocaleString('en-US');
     this.el.healthBar.style.width = `${Math.max(0, health)}%`;
@@ -117,19 +153,21 @@ export class Hud {
     if (s) s.style.borderColor = on ? '#ff4d5e' : '';
   }
 
+  // ---- dispatch list -------------------------------------------------------
   setDispatch(units) {
     const html = units.length === 0
       ? '<div class="unit"><span class="call">—</span><span class="kind">NO UNITS</span><span class="st">CLEAR</span></div>'
       : units.map((u) =>
         `<div class="unit"><span class="call">${u.call}</span><span class="kind">${u.kind}</span>` +
         `<span class="dist">${u.dist} m</span><span class="st ${u.cls}">${u.status}</span></div>`).join('');
-    // Rebuilding the list costs layout every frame; a pursuit's distances do
-    // change, but a quiet street shows the same "NO UNITS" block for hours.
+    // A pursuit's distances change; a quiet street shows the same empty block
+    // for hours, so compare before paying for innerHTML.
     if (html === this._dispatchHtml) return;
     this._dispatchHtml = html;
     this.el.dispatchList.innerHTML = html;
   }
 
+  // ---- speedometer ---------------------------------------------------------
   setSpeed(kmh, carName, enginePct, radio) {
     const speedHtml = `${Math.round(kmh)} <small>KM/H</small>`;
     if (speedHtml !== this._speedHtml) {
@@ -150,14 +188,14 @@ export class Hud {
       this._radio = radio;
       this.el.radioLine.textContent = radio;
     }
-    // On foot the engine gauge is hidden (see the CSS) and the panel is tagged
-    // so the label colour changes — no dead "ENGINE 96%" readout.
+    // On foot the engine gauge is hidden by CSS and the panel is tagged so the
+    // label colour changes — no dead "ENGINE 96%" readout.
     this.el.speedo.classList.toggle('onfoot', carName === 'ON FOOT');
   }
 
+  // ---- place and clock -----------------------------------------------------
   setLocation(street, district) {
     const html = `${district}<small>${street}</small>`;
-    // Rebuilding innerHTML every frame is wasted work when nothing changed.
     if (html === this._locHtml) return;
     this._locHtml = html;
     this.el.locName.innerHTML = html;
@@ -167,6 +205,7 @@ export class Hud {
     this.el.clock.textContent = formatClock(minutes);
   }
 
+  // ---- transient messages --------------------------------------------------
   ticker(name, avatar, text, dur = 6) {
     this.el.tickerName.textContent = name;
     this.el.tickerAvatar.textContent = avatar;
@@ -181,6 +220,14 @@ export class Hud {
     this.centerTimer = dur;
   }
 
+  toast(text, dur = 2.4) {
+    if (!this.el.toast) return;
+    this.el.toast.textContent = text;
+    this.el.toast.style.opacity = '1';
+    this.toastTimer = dur;
+  }
+
+  // ---- full-screen feedback ------------------------------------------------
   damageFlash(strength) {
     if (!this.el.dmgFlash) return;
     this.el.dmgFlash.style.boxShadow = `inset 0 0 130px rgba(255,0,0,${0.25 + strength * 0.5})`;
@@ -191,8 +238,13 @@ export class Hud {
     }, 170);
   }
 
-  setCrosshair(on) { this.el.crosshair.style.display = on ? 'block' : 'none'; }
-  setFps(n) { this.el.fpsTag.textContent = n ? `${n} FPS` : ''; }
+  /** The low-health vignette: a red edge that strengthens as health falls. */
+  setHealthTone(health) {
+    if (!this.el.dmgFlash) return;
+    if (health > 35 || this._flashTimer) return;   // a hit flash wins
+    const p = 1 - Math.max(0, health) / 35;
+    this.el.dmgFlash.style.boxShadow = `inset 0 0 130px rgba(255,0,0,${(p * 0.22).toFixed(3)})`;
+  }
 
   /** The small "E — ENTER CAR" line above the crosshair. */
   setPrompt(text) {
@@ -208,80 +260,69 @@ export class Hud {
     this.el.arrestFill.style.width = `${Math.round(Math.max(0, Math.min(1, p)) * 100)}%`;
   }
 
-  /** The low-health vignette: a red edge that strengthens as health falls. */
-  setHealthTone(health) {
-    if (!this.el.dmgFlash) return;
-    if (health > 35 || this._flashTimer) return;   // a hit flash wins
-    const p = 1 - Math.max(0, health) / 35;
-    this.el.dmgFlash.style.boxShadow = `inset 0 0 130px rgba(255,0,0,${(p * 0.22).toFixed(3)})`;
-  }
+  setCrosshair(on) { this.el.crosshair.style.display = on ? 'block' : 'none'; }
+  setFps(n) { this.el.fpsTag.textContent = n ? `${n} FPS` : ''; }
 
-  /** A short toast under the mission card (pickups, crimes, saves). */
-  toast(text, dur = 2.4) {
-    if (!this.el.toast) return;
-    this.el.toast.textContent = text;
-    this.el.toast.style.opacity = '1';
-    this.toastTimer = dur;
-  }
-
-  /** The circular minimap: streets, sea, player arrow, police blips, marker. */
+  // ---- minimap -------------------------------------------------------------
+  /** Streets, sea, player arrow, police blips, the marker and the roadblock. */
   drawMinimap(px, pz, heading, police, marker, heli, roadblock = null) {
     const g = this.mm;
-    const S = 202, C = S / 2;
-    const range = 200;
-    const scale = S / range;
-    g.clearRect(0, 0, S, S);
+    const C = MAP_SIZE / 2;
+    g.clearRect(0, 0, MAP_SIZE, MAP_SIZE);
     g.save();
     g.beginPath();
     g.arc(C, C, C - 2, 0, Math.PI * 2);
     g.clip();
 
-    // Land and water.
+    // Land, then the rotated world layer on top of it.
     g.fillStyle = '#14304e';
-    g.fillRect(0, 0, S, S);
+    g.fillRect(0, 0, MAP_SIZE, MAP_SIZE);
     g.save();
     g.translate(C, C);
     g.rotate(heading);
-    g.translate(-px * scale, -pz * scale);
+    g.translate(-px * MAP_SCALE, -pz * MAP_SCALE);
 
-    // The sea to the south of the coast road, and the sand strip above it.
+    // The sea south of the coast road, with a sand strip above it.
     g.fillStyle = '#1d5c8c';
-    g.fillRect((-CITY_HALF - 60) * scale, (COAST_Z + 6) * scale, (CITY_HALF * 2 + 120) * scale, 200 * scale);
+    g.fillRect((-CITY_HALF - 60) * MAP_SCALE, (COAST_Z + 6) * MAP_SCALE,
+      (CITY_HALF * 2 + 120) * MAP_SCALE, 200 * MAP_SCALE);
     g.fillStyle = '#e8d9a8';
-    g.fillRect((-CITY_HALF - 60) * scale, COAST_Z * scale, (CITY_HALF * 2 + 120) * scale, 7 * scale);
+    g.fillRect((-CITY_HALF - 60) * MAP_SCALE, COAST_Z * MAP_SCALE,
+      (CITY_HALF * 2 + 120) * MAP_SCALE, 7 * MAP_SCALE);
     // The cargo port yard, west of the grid, so the docks are on the map.
     g.fillStyle = '#3a4553';
-    g.fillRect((-CITY_HALF - 150) * scale, -160 * scale, 150 * scale, 190 * scale);
+    g.fillRect((-CITY_HALF - 150) * MAP_SCALE, -160 * MAP_SCALE, 150 * MAP_SCALE, 190 * MAP_SCALE);
 
     // Streets: a wide dark band plus a lighter centreline.
-    g.strokeStyle = '#2c3d52';
-    g.lineWidth = 8;
-    for (let i = 0; i <= GRID; i++) {
-      const c = streetCoord(i);
-      g.beginPath(); g.moveTo(c * scale, (-CITY_HALF - 40) * scale); g.lineTo(c * scale, (CITY_HALF + 60) * scale); g.stroke();
-      g.beginPath(); g.moveTo((-CITY_HALF - 40) * scale, c * scale); g.lineTo((CITY_HALF + 40) * scale, c * scale); g.stroke();
+    for (const [width, color] of [[8, '#2c3d52'], [1.4, '#54687e']]) {
+      g.strokeStyle = color;
+      g.lineWidth = width;
+      for (let i = 0; i <= GRID; i++) {
+        const c = streetCoord(i);
+        g.beginPath(); g.moveTo(c * MAP_SCALE, (-CITY_HALF - 40) * MAP_SCALE);
+        g.lineTo(c * MAP_SCALE, (CITY_HALF + 60) * MAP_SCALE); g.stroke();
+        g.beginPath(); g.moveTo((-CITY_HALF - 40) * MAP_SCALE, c * MAP_SCALE);
+        g.lineTo((CITY_HALF + 40) * MAP_SCALE, c * MAP_SCALE); g.stroke();
+      }
     }
-    g.strokeStyle = '#54687e';
-    g.lineWidth = 1.4;
-    for (let i = 0; i <= GRID; i++) {
-      const c = streetCoord(i);
-      g.beginPath(); g.moveTo(c * scale, (-CITY_HALF - 40) * scale); g.lineTo(c * scale, (CITY_HALF + 60) * scale); g.stroke();
-      g.beginPath(); g.moveTo((-CITY_HALF - 40) * scale, c * scale); g.lineTo((CITY_HALF + 40) * scale, c * scale); g.stroke();
-    }
-    // The highway bridge west over the water.
+    // The highway bridge west over the water, then the boardwalk deck.
     g.strokeStyle = '#54687e';
     g.lineWidth = 6;
-    g.beginPath(); g.moveTo((-CITY_HALF - 160) * scale, (COAST_Z - 40) * scale); g.lineTo((-CITY_HALF + 20) * scale, (COAST_Z - 40) * scale); g.stroke();
-    // The boardwalk deck.
+    g.beginPath();
+    g.moveTo((-CITY_HALF - 160) * MAP_SCALE, (COAST_Z - 40) * MAP_SCALE);
+    g.lineTo((-CITY_HALF + 20) * MAP_SCALE, (COAST_Z - 40) * MAP_SCALE);
+    g.stroke();
     g.fillStyle = '#9a7b52';
-    g.fillRect(5 * scale, (COAST_Z + 4) * scale, 50 * scale, 32 * scale);
+    g.fillRect(5 * MAP_SCALE, (COAST_Z + 4) * MAP_SCALE, 50 * MAP_SCALE, 32 * MAP_SCALE);
 
-    // Mission marker: a pulsing diamond.
+    // Mission marker: a pulsing diamond, coloured by objective type.
     if (marker) {
       const pulse = 1 + Math.sin(performance.now() / 190) * 0.28;
-      g.fillStyle = marker.color === 0x4da3ff ? '#4da3ff' : marker.color === 0xff4d5e ? '#ff4d5e' : marker.color === 0x7dffa8 ? '#7dffa8' : '#ffd75e';
+      g.fillStyle = marker.color === 0x4da3ff ? '#4da3ff'
+        : marker.color === 0xff4d5e ? '#ff4d5e'
+          : marker.color === 0x7dffa8 ? '#7dffa8' : '#ffd75e';
       g.save();
-      g.translate(marker.x * scale, marker.z * scale);
+      g.translate(marker.x * MAP_SCALE, marker.z * MAP_SCALE);
       g.rotate(Math.PI / 4);
       const s = 6 * pulse;
       g.fillRect(-s, -s, s * 2, s * 2);
@@ -290,17 +331,17 @@ export class Hud {
     // Police blips (red) and the helicopter (blue).
     for (const p of police) {
       g.fillStyle = '#ff3b30';
-      g.beginPath(); g.arc(p.x * scale, p.z * scale, 4.6, 0, Math.PI * 2); g.fill();
+      g.beginPath(); g.arc(p.x * MAP_SCALE, p.z * MAP_SCALE, 4.6, 0, Math.PI * 2); g.fill();
       g.strokeStyle = '#fff'; g.lineWidth = 1.4; g.stroke();
     }
     if (heli) {
       g.fillStyle = '#4da3ff';
-      g.beginPath(); g.arc(heli.x * scale, heli.z * scale, 5.2, 0, Math.PI * 2); g.fill();
+      g.beginPath(); g.arc(heli.x * MAP_SCALE, heli.z * MAP_SCALE, 5.2, 0, Math.PI * 2); g.fill();
     }
     // A roadblock is a hazard, not a unit: an orange chevron across the road.
     if (roadblock) {
       g.save();
-      g.translate(roadblock.x * scale, roadblock.z * scale);
+      g.translate(roadblock.x * MAP_SCALE, roadblock.z * MAP_SCALE);
       g.rotate(roadblock.heading + Math.PI / 4);
       g.fillStyle = '#ff9f43';
       g.fillRect(-6, -6, 12, 12);
@@ -322,6 +363,7 @@ export class Hud {
     g.restore();
   }
 
+  // ---- per-frame countdowns ------------------------------------------------
   update(dt) {
     if (this.toastTimer > 0) {
       this.toastTimer -= dt;
@@ -339,12 +381,4 @@ export class Hud {
       if (this.tickerTimer <= 0) this.el.tickerText.textContent = '';
     }
   }
-}
-
-function rankTitle(rank) {
-  if (rank >= 9) return 'KINGPIN';
-  if (rank >= 7) return 'CREW BOSS';
-  if (rank >= 5) return 'ENFORCER';
-  if (rank >= 3) return 'RUNNER';
-  return 'STREET';
 }

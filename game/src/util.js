@@ -1,10 +1,22 @@
-// Deterministic randomness, math helpers and canvas-texture helpers shared by
-// the city, the vehicles and the props. Nothing here touches the DOM except
-// canvas textures, and every generator is seeded so a session replays the same
-// city (and so a screenshot preset is reproducible).
+// Shared helpers for PORT AZUL: the seeded PRNG, math and easing, the game's
+// heading convention, canvas textures, colour work, geometry batching, GPU
+// disposal and HUD formatting. The city, the vehicles, the props and the HUD
+// all draw from here so their random draws and their conventions agree.
+//
+// Every generator takes its stream as an argument (mulberry32 for a reproducible
+// run, Math.random where variety is fine), which is what lets a screenshot preset
+// pin a seed and replay the same city. Nothing in this file touches the DOM except
+// to build a canvas texture.
 import * as THREE from 'three';
 
-/** mulberry32: a small, fast, seedable PRNG returning floats in [0, 1). */
+// ===========================================================================
+// Seeded randomness
+// ===========================================================================
+
+/**
+ * mulberry32 — a small, fast, seedable PRNG returning floats in [0, 1).
+ * Deterministic per seed, so one seed lays out one identical city.
+ */
 export function mulberry32(seed) {
   let a = seed >>> 0;
   return () => {
@@ -15,16 +27,45 @@ export function mulberry32(seed) {
   };
 }
 
+/** A float in [lo, hi) drawn from a stream. */
+export function randRange(rnd, lo, hi) { return lo + rnd() * (hi - lo); }
+
+/** An inclusive integer in [lo, hi] drawn from a stream. */
+export function randInt(rnd, lo, hi) { return lo + Math.floor(rnd() * (hi - lo + 1)); }
+
+/** One element of `arr`, drawn from a stream. */
+export function pick(rnd, arr) { return arr[Math.floor(rnd() * arr.length)]; }
+
+// ===========================================================================
+// Scalar maths and easing
+// ===========================================================================
+
 export const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
 export const lerp = (a, b, t) => a + (b - a) * t;
-/** Frame-rate independent exponential approach: `rate` is how fast, per second. */
+
+/** Frame-rate independent exponential approach; `rate` is speed per second. */
 export const damp = (a, b, rate, dt) => lerp(a, b, 1 - Math.exp(-rate * dt));
 
+/** Hermite smoothstep, for easing camera and UI motion. */
+export function smoothstep(t) { return t * t * (3 - 2 * t); }
+
+/** Move `cur` toward `target` by at most `maxDelta`. */
+export function moveTowards(cur, target, maxDelta) {
+  const d = target - cur;
+  if (Math.abs(d) <= maxDelta) return target;
+  return cur + Math.sign(d) * maxDelta;
+}
+
+// ===========================================================================
+// Headings and distances
+// ===========================================================================
+
 export const TAU = Math.PI * 2;
+
 /**
- * Smallest signed difference between two headings. `damp` is not used here on
- * purpose: a camera should reach its target heading at a bounded rate rather
- * than asymptotically, so a 180-degree turn takes the same time every frame.
+ * Smallest signed difference between two headings. `damp` is deliberately not
+ * used here: a camera should reach its target heading at a bounded rate rather
+ * than asymptotically, so a half turn takes the same time on any frame.
  */
 export function angleDelta(a, b) {
   let d = (b - a) % TAU;
@@ -32,6 +73,22 @@ export function angleDelta(a, b) {
   if (d < -Math.PI) d += TAU;
   return d;
 }
+
+/** Squared distance — cheap rejection test for nearest-of queries. */
+export function dist2(ax, az, bx, bz) {
+  const dx = ax - bx, dz = az - bz;
+  return dx * dx + dz * dz;
+}
+
+/** Plain distance, for callers that only need a magnitude once. */
+export function dist(ax, az, bx, bz) { return Math.sqrt(dist2(ax, az, bx, bz)); }
+
+/** The heading that faces from (ax,az) toward (bx,bz), in the game's convention. */
+export function headingTo(ax, az, bx, bz) { return Math.atan2(-(bx - ax), -(bz - az)); }
+
+// ===========================================================================
+// Canvas textures
+// ===========================================================================
 
 /** A canvas texture with sRGB colour space and repeat wrapping. */
 export function canvasTexture(w, h, draw, repeatX = 1, repeatY = 1) {
@@ -47,6 +104,10 @@ export function canvasTexture(w, h, draw, repeatX = 1, repeatY = 1) {
   return tex;
 }
 
+// ===========================================================================
+// Colour
+// ===========================================================================
+
 /** Multiply a #rrggbb colour's channels by f, for shading a facade. */
 export function shade(hex, f) {
   const n = parseInt(hex.slice(1), 16);
@@ -54,56 +115,22 @@ export function shade(hex, f) {
   return `rgb(${ch(16)},${ch(8)},${ch(0)})`;
 }
 
-/** A colour that reads as lit at night: a facade's window colour ramp. */
-export const WINDOW_LIT = ['#ffd98a', '#ffe6b0', '#fff3c8', '#cfe6ff'];
-
 /** Interpolate two hex colours, returning a THREE.Color. */
 export function mixColor(hexA, hexB, t) {
   return new THREE.Color(hexA).lerp(new THREE.Color(hexB), t);
 }
 
-/** A float in [lo, hi) from a generator (seeded or Math.random). */
-export function randRange(rnd, lo, hi) { return lo + rnd() * (hi - lo); }
+/** Window colours that read as lit at night: a facade's window ramp. */
+export const WINDOW_LIT = ['#ffd98a', '#ffe6b0', '#fff3c8', '#cfe6ff'];
 
-/** An inclusive integer in [lo, hi] from a generator. */
-export function randInt(rnd, lo, hi) { return lo + Math.floor(rnd() * (hi - lo + 1)); }
-
-/** A random element of `arr` from a generator. */
-export function pick(rnd, arr) { return arr[Math.floor(rnd() * arr.length)]; }
-
-/** Squared distance: cheap rejection test for nearest-of queries. */
-export function dist2(ax, az, bx, bz) { const dx = ax - bx, dz = az - bz; return dx * dx + dz * dz; }
-
-/** The plain distance, for callers that only need a magnitude once. */
-export function dist(ax, az, bx, bz) { return Math.sqrt(dist2(ax, az, bx, bz)); }
-
-/** The heading that faces from (ax,az) to (bx,bz), in the game's convention. */
-export function headingTo(ax, az, bx, bz) { return Math.atan2(-(bx - ax), -(bz - az)); }
-
-/** Move `cur` toward `target` by at most `maxDelta`. */
-export function moveTowards(cur, target, maxDelta) {
-  const d = target - cur;
-  if (Math.abs(d) <= maxDelta) return target;
-  return cur + Math.sign(d) * maxDelta;
-}
-
-/** Hermite smoothstep, for easing camera and UI motion. */
-export function smoothstep(t) { return t * t * (3 - 2 * t); }
-
-/** Millions-formatted money, matching the HUD's counter. */
-export function formatMoney(n) { return '$' + Math.round(n).toLocaleString('en-US'); }
-
-/** "HH:MM" from minutes since midnight, for the HUD clock. */
-export function formatClock(minutes) {
-  const h = Math.floor(minutes / 60) % 24;
-  const m = Math.floor(minutes % 60);
-  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
-}
+// ===========================================================================
+// Geometry batching
+// ===========================================================================
 
 /**
  * Merge transformed copies of geometries into one non-indexed BufferGeometry.
- * Used to build a whole palm crown (or a cluster of nuts) as a single draw
- * call instead of one mesh per frond.
+ * Used to build a whole palm crown (or a cluster of nuts) as a single draw call
+ * instead of one mesh per frond.
  */
 export function mergeGeoms(parts) {
   const pos = [], norm = [], uv = [], col = [];
@@ -134,42 +161,6 @@ export function mergeGeoms(parts) {
   out.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
   out.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
   return out;
-}
-
-/**
- * True for a geometry or material that belongs to a module-level cache and is
- * shared by many meshes. `disposeGroup` uses this to release only per-instance
- * resources; disposing a shared one would break every other model.
- */
-export function isSharedResource(r) {
-  return !!(r && r.userData && r.userData.shared);
-}
-
-/**
- * Release the per-instance GPU resources under `root`: every geometry and
- * material not flagged shared. Called when a car is replaced, stolen or a
- * police unit is cleared, so a long session does not accumulate buffers for
- * cars that are no longer on the road.
- */
-export function disposeGroup(root) {
-  if (!root) return;
-  const release = (x) => {
-    if (!x || isSharedResource(x)) return;
-    // A material's map is a GPU resource of its own; a per-instance texture
-    // (a decal, a plate) must go with the material or it leaks on every
-    // stolen car and cleared cruiser.
-    const map = x.map;
-    if (map && !isSharedResource(map)) map.dispose();
-    x.dispose();
-  };
-  root.traverse((o) => {
-    if (!o.isMesh && !o.isLine && !o.isPoints) return;
-    const g = o.geometry;
-    if (g && !isSharedResource(g)) g.dispose();
-    const m = o.material;
-    if (Array.isArray(m)) m.forEach(release);
-    else release(m);
-  });
 }
 
 /**
@@ -212,4 +203,58 @@ export function mergeSharedMaterials(group, skip = null) {
     made++;
   }
   return made;
+}
+
+// ===========================================================================
+// GPU resource ownership
+// ===========================================================================
+
+/**
+ * True for a geometry or material that belongs to a module-level cache and is
+ * shared by many meshes. `disposeGroup` uses this to release only per-instance
+ * resources; disposing a shared one would break every other model.
+ */
+export function isSharedResource(r) {
+  return !!(r && r.userData && r.userData.shared);
+}
+
+/**
+ * Release the per-instance GPU resources under `root`: every geometry and
+ * material not flagged shared. Called when a car is replaced, stolen or a police
+ * unit is cleared, so a long session does not accumulate buffers for cars that
+ * are no longer on the road.
+ */
+export function disposeGroup(root) {
+  if (!root) return;
+  const release = (x) => {
+    if (!x || isSharedResource(x)) return;
+    // A material's map is a GPU resource of its own; a per-instance texture
+    // (a decal, a plate) must go with the material or it leaks on every stolen
+    // car and cleared cruiser.
+    const map = x.map;
+    if (map && !isSharedResource(map)) map.dispose();
+    x.dispose();
+  };
+  root.traverse((o) => {
+    if (!o.isMesh && !o.isLine && !o.isPoints) return;
+    const g = o.geometry;
+    if (g && !isSharedResource(g)) g.dispose();
+    const m = o.material;
+    if (Array.isArray(m)) m.forEach(release);
+    else release(m);
+  });
+}
+
+// ===========================================================================
+// Formatting for the HUD
+// ===========================================================================
+
+/** Millions-formatted money, matching the HUD's counter. */
+export function formatMoney(n) { return '$' + Math.round(n).toLocaleString('en-US'); }
+
+/** "HH:MM" from minutes since midnight, for the HUD clock. */
+export function formatClock(minutes) {
+  const h = Math.floor(minutes / 60) % 24;
+  const m = Math.floor(minutes % 60);
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
 }

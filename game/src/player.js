@@ -1,8 +1,14 @@
 // Player: Marlow Reyes on foot and behind the wheel.
-// Car physics are arcade — accelerate, brake, steer with speed-scaled
-// authority, handbrake slides — plus collision response against building
-// footprints, the sea and traffic. On foot the walker is camera-relative with
-// a sprint stamina budget and a jump.
+//
+// Two bodies, one state machine. On foot the walker is camera-relative with a
+// sprint stamina budget, a jump and a collision slide that pushes out of a
+// building footprint instead of stopping dead. Driving is arcade physics:
+// accelerate, brake, steer with speed-scaled authority and a handbrake slide,
+// plus collision response against buildings, the sea and traffic.
+//
+// The module owns no input policy of its own; it reads the shared Input object
+// the game passes in each step and returns an event object while driving
+// ({crashed, hard}) so the game can play crash audio and shake the camera.
 import * as THREE from 'three';
 import { makeCar, makePerson } from './vehicles.js';
 import { clamp, damp, disposeGroup } from './util.js';
@@ -16,33 +22,47 @@ export class Player {
   constructor(scene, city) {
     this.scene = scene;
     this.city = city;
+
+    // Where the body is and which way it faces (0 = +z; a car's nose is -z).
     this.x = 30; this.z = 96;
-    this.heading = Math.PI;         // 0 = +z; a car's nose is local -z
+    this.heading = Math.PI;
     this.speed = 0;                 // m/s, signed (negative = reversing)
+
+    // Locomotion mode and the current ride.
     this.inCar = false;
     this.onFoot = true;
     this.car = null;
     this.carName = 'BRISA GT';
     this.topSpeed = 42;
     this.enginePct = 96;
+
+    // Vitals and the stamina/jump state used on foot.
     this.health = 100;
     this.armour = 40;
     this.stamina = 100;
     this.jumpY = 0;
     this.jumpVY = 0;
     this.grounded = true;
+    this.groundY = 0;
+
+    // Damage bookkeeping.
     this.tiresPopped = false;
     this.collisionCooldown = 0;
+    this.crashShake = 0;
+
+    // Camera angles and the driving look-around offset.
     this.camYaw = Math.PI;
     this.camPitch = 0.32;
-    this.camOrbit = 0;              // mouse look-around while driving
+    this.camOrbit = 0;
+
+    // Walk cycle, melee and the distance since the last footstep.
     this.walkPhase = 0;
     this.meleeCooldown = 0;
     this.meleeSwing = 0;
-    this.crashShake = 0;
-    this.groundY = 0;
-    this.stepAcc = 0;               // distance walked since the last footstep
-    this.events = [];              // {type:'step'|'jump'|'land', ...} drained by the game
+    this.stepAcc = 0;
+
+    // Events raised for the game to drain: step, jump, land.
+    this.events = [];
     this.limit = city.worldLimit();
 
     this.body = makePerson(0x2ea88a, 0x2a3a55);
@@ -50,6 +70,7 @@ export class Player {
     scene.add(this.body);
   }
 
+  // ---- changing rides ------------------------------------------------------
   /** Park the hero car and step straight into it (the start of a job). */
   spawnCar(x, z, heading) {
     if (this.car) { this.scene.remove(this.car); disposeGroup(this.car); }
@@ -100,10 +121,10 @@ export class Player {
   /** Step out on the driver's side, moved aside if that spot is blocked. */
   exitCar() {
     if (!this.car) return;
-    const cands = [];
     // The driver's door is the left side of the car (local -x), which in world
     // space is +cos(heading) for heading 0; test it first so exiting parks the
     // walker on the pavement side, not the traffic side.
+    const cands = [];
     for (const side of [1, -1]) {
       cands.push([this.x + Math.cos(this.heading) * side * 2.4, this.z - Math.sin(this.heading) * side * 2.4]);
     }
@@ -143,6 +164,7 @@ export class Player {
     this.car = null;
   }
 
+  // ---- damage --------------------------------------------------------------
   damage(amount, cause = 'hit') {
     if (this.health <= 0) return true;
     if (this.armour > 0) {
@@ -157,9 +179,9 @@ export class Player {
 
   heal(n) { this.health = Math.min(100, this.health + n); }
   addArmour(n) { this.armour = Math.min(100, this.armour + n); }
-
   speedKmh() { return Math.abs(this.speed) * 3.6; }
 
+  // ---- per-step dispatch ---------------------------------------------------
   update(dt, input, traffic) {
     this.collisionCooldown -= dt;
     this.meleeCooldown -= dt;
@@ -176,6 +198,7 @@ export class Player {
     return this.updateWalking(dt, input);
   }
 
+  // ---- shared movement helpers --------------------------------------------
   /** Is there room to stand at (x,z)? Used by the enter/exit logic. */
   canStand(x, z) {
     return !this.city.hitsBuilding(x, z, 0.9) && !this.city.isWater(x, z);
@@ -300,6 +323,7 @@ export class Player {
     this.x = clamp(this.x, this.limit.minX, this.limit.maxX);
     this.z = clamp(this.z, this.limit.minZ, this.limit.maxZ);
 
+    // Pose the car: ground height, heading, body roll/pitch and spinning wheels.
     const gh = this.city.groundHeightAt(this.x, this.z);
     this.groundY = gh;
     this.car.position.set(this.x, gh, this.z);
@@ -372,6 +396,8 @@ export class Player {
       }
     }
 
+    // Pose the walker: ground plus jump height, facing, and a limb swing whose
+    // amplitude follows the walk phase.
     this.groundY = this.city.groundHeightAt(this.x, this.z);
     this.body.position.set(this.x, this.groundY + this.jumpY, this.z);
     this.body.rotation.y = this.heading;
